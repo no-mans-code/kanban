@@ -3,6 +3,7 @@ pub mod dag;
 pub mod demo;
 pub mod error;
 pub mod events;
+pub mod guard;
 pub mod models;
 pub mod web;
 
@@ -37,7 +38,11 @@ pub async fn open_db(path: &Path) -> anyhow::Result<SqlitePool> {
 }
 
 pub fn router(state: AppState) -> Router {
-    api::routes().fallback(web::static_handler).with_state(state).layer(TraceLayer::new_for_http())
+    api::routes()
+        .fallback(web::static_handler)
+        .with_state(state)
+        .layer(axum::middleware::from_fn(guard::middleware))
+        .layer(TraceLayer::new_for_http())
 }
 
 /// Every mutation goes through here. IMMEDIATE takes the write lock up front,

@@ -46,6 +46,11 @@ and the Docker setup publishes it on the host's 127.0.0.1 only. You choose
 who you are "acting as" in the top-right corner; that is attribution, not
 security. Don't expose it to a network without putting auth in front.
 
+Because "localhost only" doesn't stop web pages in your own browser, every
+request's `Host` and `Origin` headers must name an allowed host (loopback by
+default). Other requests get `403`. This blocks DNS-rebinding and cross-site
+attacks from malicious websites (`server/src/guard.rs`).
+
 ### Configuration (environment variables)
 
 | Variable | Default | Meaning |
@@ -53,6 +58,7 @@ security. Don't expose it to a network without putting auth in front.
 | `KANBAN_DB` | `data/kanban.db` (relative to the working directory) | SQLite file; created with its directory if missing |
 | `KANBAN_PORT` | `8610` | HTTP port |
 | `KANBAN_BIND` | `127.0.0.1` | Listen address; logs a warning if not loopback |
+| `KANBAN_ALLOWED_HOSTS` | *(empty)* | Extra host names the board may be reached by, comma-separated (loopback names are always allowed). Needed only if you serve it on a LAN name or IP |
 | `KANBAN_DEMO` | `0` | `1` = same as `--demo` |
 | `RUST_LOG` | `kanban_server=info,tower_http=warn` | Log filter |
 
@@ -109,7 +115,9 @@ Breaking one of these breaks the product. Keep them.
     which sanitizes with DOMPurify. Comments and descriptions are written by
     agents too, so treat them as untrusted. Never `{@html}` anything else.
 11. **No authentication by design**; keep the default bind on loopback.
-    `X-Actor: <user id>` only attributes changes.
+    `X-Actor: <user id>` only attributes changes. The `guard.rs` middleware
+    (Host/Origin allow-list) is the only thing standing between a malicious
+    web page and the API. Never remove it or add permissive CORS.
 
 ### Repository map
 
@@ -124,6 +132,7 @@ kanban/
     src/main.rs                     env config, `--demo`, `healthcheck` subcommand, starts axum
     src/lib.rs                      AppState, open_db (WAL, foreign keys, migrations), router(), write_tx(), now_ms()
     src/error.rs                    AppError -> JSON {error:{code,message,detail}}; maps sqlx constraint errors to 400/409
+    src/guard.rs                    Host/Origin allow-list middleware (DNS rebinding + cross-site protection)
     src/events.rs                   broadcast channel feeding SSE
     src/dag.rs                      pure graph algorithms + unit tests (cycle path, longest chain, chain through a new edge)
     src/models.rs                   row structs, SUMMARY_SELECT (the one ticket-summary query), shared helpers

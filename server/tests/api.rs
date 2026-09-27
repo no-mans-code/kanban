@@ -301,3 +301,31 @@ async fn validation_errors_are_json() {
     let (status, _) = t.req(Method::GET, "/api/does-not-exist", None).await;
     assert_eq!(status, 404);
 }
+
+async fn with_headers(t: &TestApp, method: Method, uri: &str, headers: &[(&str, &str)]) -> u16 {
+    let mut req = Request::builder().method(method).uri(uri).header("content-type", "application/json");
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let body = Body::from(json!({ "username": "probe" }).to_string());
+    t.app.clone().oneshot(req.body(body).unwrap()).await.unwrap().status().as_u16()
+}
+
+#[tokio::test]
+async fn foreign_hosts_and_origins_are_rejected() {
+    let t = TestApp::new().await;
+    // DNS rebinding: a hostile name that resolves to 127.0.0.1.
+    assert_eq!(with_headers(&t, Method::GET, "/api/users", &[("host", "attacker.example:8610")]).await, 403);
+    assert_eq!(with_headers(&t, Method::GET, "/", &[("host", "localhost.attacker.example")]).await, 403);
+    // A cross-site write.
+    let origin = [("host", "127.0.0.1:8610"), ("origin", "https://attacker.example")];
+    assert_eq!(with_headers(&t, Method::POST, "/api/users", &origin).await, 403);
+    assert_eq!(with_headers(&t, Method::POST, "/api/users", &[("origin", "null")]).await, 403);
+    assert_eq!(t.get("/api/users").await.as_array().unwrap().len(), 0, "nothing was created");
+
+    // The UI itself, the Vite dev proxy and IPv6 loopback still work.
+    let same_origin = [("host", "127.0.0.1:8610"), ("origin", "http://127.0.0.1:8610")];
+    assert_eq!(with_headers(&t, Method::POST, "/api/users", &same_origin).await, 201);
+    assert_eq!(with_headers(&t, Method::GET, "/api/users", &[("host", "localhost:5173")]).await, 200);
+    assert_eq!(with_headers(&t, Method::GET, "/api/health", &[("host", "[::1]:8610")]).await, 200);
+}

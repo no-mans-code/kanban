@@ -11,6 +11,7 @@ services:
     restart: unless-stopped
     environment:
       KANBAN_DEMO: ${KANBAN_DEMO:-0}
+      KANBAN_ALLOWED_HOSTS: ${KANBAN_ALLOWED_HOSTS:-}
       RUST_LOG: ${RUST_LOG:-kanban_server=info,tower_http=warn}
     ports:
       # Host side stays on 127.0.0.1: the board has no authentication.
