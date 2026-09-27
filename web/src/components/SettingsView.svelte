@@ -250,8 +250,12 @@
                 title="WIP limit for this column"
                 aria-label="WIP limit"
                 onchange={(e) => {
-                  const n = e.currentTarget.value.trim()
-                  wfCall(() => api.updateStatus(s.id, { wip_limit: n === '' ? null : Math.max(1, Number(n)) }))
+                  const n = Math.round(Number(e.currentTarget.value.trim()))
+                  // A number input still accepts "1.5", "-3" or garbage by keyboard;
+                  // send a clean value (a whole number >= 1) rather than a raw one the
+                  // server would reject as an int, or fall back to "no limit".
+                  const wip_limit = Number.isFinite(n) && n >= 1 ? n : null
+                  wfCall(() => api.updateStatus(s.id, { wip_limit }))
                 }}
               />
               {#if canEditWorkflow}
