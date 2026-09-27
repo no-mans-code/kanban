@@ -1,0 +1,22 @@
+# docker compose up -d --build     start (data persists in the kanban-data volume)
+# docker compose down              stop (data is kept)
+# docker compose down -v           stop AND delete all board data
+# KANBAN_DEMO=1 docker compose up -d --build   also seed a DEMO project on first start
+
+services:
+  kanban:
+    build: .
+    image: kanban-board:latest
+    container_name: kanban-board
+    restart: unless-stopped
+    environment:
+      KANBAN_DEMO: ${KANBAN_DEMO:-0}
+      RUST_LOG: ${RUST_LOG:-kanban_server=info,tower_http=warn}
+    ports:
+      # Host side stays on 127.0.0.1: the board has no authentication.
+      - "127.0.0.1:${KANBAN_PORT:-8610}:8610"
+    volumes:
+      - kanban-data:/data
+
+volumes:
+  kanban-data:

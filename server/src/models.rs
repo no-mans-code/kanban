@@ -1,0 +1,300 @@
+use std::collections::HashMap;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sqlx::{FromRow, QueryBuilder, Sqlite, SqliteConnection};
+
+use crate::error::{ApiResult, AppError};
+
+pub const TYPES: [&str; 5] = ["epic", "story", "task", "bug", "subtask"];
+pub const PRIORITIES: [&str; 5] = ["highest", "high", "medium", "low", "lowest"];
+pub const CATEGORIES: [&str; 3] = ["todo", "in_progress", "done"];
+pub const LINK_KINDS: [&str; 4] = ["blocks", "relates", "duplicates", "clones"];
+
+pub const PALETTE: [&str; 10] = [
+    "#6366f1", "#22c55e", "#f59e0b", "#ec4899", "#06b6d4", "#a855f7", "#ef4444", "#14b8a6", "#f97316",
+    "#84cc16",
+];
+
+/// Jira's hierarchy: epic > story/task/bug > subtask. Levels strictly
+/// decrease, so the parent tree can never contain a cycle.
+pub fn valid_parent(parent_type: &str, child_type: &str) -> bool {
+    match parent_type {
+        "epic" => matches!(child_type, "story" | "task" | "bug"),
+        "story" | "task" | "bug" => child_type == "subtask",
+        _ => false,
+    }
+}
+
+pub fn check_one_of(field: &str, value: &str, allowed: &[&str]) -> ApiResult<()> {
+    if allowed.contains(&value) {
+        Ok(())
+    } else {
+        Err(AppError::invalid(format!("{field} must be one of: {}", allowed.join(", "))))
+    }
+}
+
+pub fn clean_title(title: &str) -> ApiResult<String> {
+    let t = title.trim();
+    if t.is_empty() {
+        return Err(AppError::invalid("Title cannot be empty"));
+    }
+    if t.chars().count() > 300 {
+        return Err(AppError::invalid("Title is limited to 300 characters"));
+    }
+    Ok(t.to_string())
+}
+
+/// Distinguishes an absent field (None) from an explicit null (Some(None)).
+pub fn double_option<'de, T, D>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+fn id_list<S: Serializer>(csv: &str, s: S) -> Result<S::Ok, S::Error> {
+    let ids: Vec<i64> = csv.split(',').filter_map(|p| p.parse().ok()).collect();
+    ids.serialize(s)
+}
+
+#[derive(Serialize, FromRow)]
+pub struct User {
+    pub id: i64,
+    pub username: String,
+    pub display_name: String,
+    pub color: String,
+    pub active: bool,
+    pub created_at: i64,
+}
+
+#[derive(Serialize, FromRow)]
+pub struct Project {
+    pub id: i64,
+    pub key: String,
+    pub name: String,
+    pub description: String,
+    pub created_at: i64,
+}
+
+#[derive(Serialize, FromRow)]
+pub struct Status {
+    pub id: i64,
+    pub project_id: i64,
+    pub name: String,
+    pub category: String,
+    pub position: i64,
+}
+
+#[derive(Serialize, FromRow)]
+pub struct Label {
+    pub id: i64,
+    pub name: String,
+    pub color: String,
+}
+
+#[derive(Serialize, FromRow)]
+pub struct Comment {
+    pub id: i64,
+    pub ticket_id: i64,
+    pub author_id: Option<i64>,
+    pub body: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, FromRow)]
+pub struct Activity {
+    pub id: i64,
+    pub ticket_id: i64,
+    pub actor_id: Option<i64>,
+    pub action: String,
+    pub field: Option<String>,
+    pub old_value: Option<String>,
+    pub new_value: Option<String>,
+    pub created_at: i64,
+}
+
+/// The lightweight shape used by board, list and graph views. The
+/// description is deliberately left out; it is only in the detail view.
+#[derive(Serialize, FromRow, Clone)]
+pub struct TicketSummary {
+    pub id: i64,
+    pub key: String,
+    pub project_id: i64,
+    pub number: i64,
+    #[serde(rename = "type")]
+    pub ticket_type: String,
+    pub title: String,
+    pub status_id: i64,
+    pub status_name: String,
+    pub status_category: String,
+    pub priority: String,
+    pub assignee_id: Option<i64>,
+    pub reporter_id: Option<i64>,
+    pub parent_id: Option<i64>,
+    pub parent_key: Option<String>,
+    pub rank: f64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub resolved_at: Option<i64>,
+    #[serde(serialize_with = "id_list")]
+    pub label_ids: String,
+    pub child_count: i64,
+    pub done_child_count: i64,
+    /// Has at least one `blocks` predecessor that is not done yet.
+    pub is_blocked: bool,
+    pub comment_count: i64,
+}
+
+pub const SUMMARY_SELECT: &str = "
+SELECT t.id,
+       p.key || '-' || t.number AS key,
+       t.project_id, t.number, t.type AS ticket_type, t.title,
+       t.status_id, s.name AS status_name, s.category AS status_category,
+       t.priority, t.assignee_id, t.reporter_id, t.parent_id,
+       (SELECT pp.key || '-' || pt.number FROM tickets pt JOIN projects pp ON pp.id = pt.project_id
+         WHERE pt.id = t.parent_id) AS parent_key,
+       t.rank, t.created_at, t.updated_at, t.resolved_at,
+       COALESCE((SELECT group_concat(tl.label_id) FROM ticket_labels tl WHERE tl.ticket_id = t.id), '')
+         AS label_ids,
+       (SELECT count(*) FROM tickets c WHERE c.parent_id = t.id) AS child_count,
+       (SELECT count(*) FROM tickets c JOIN statuses cs ON cs.id = c.status_id
+         WHERE c.parent_id = t.id AND cs.category = 'done') AS done_child_count,
+       EXISTS (SELECT 1 FROM ticket_links l
+                 JOIN tickets b ON b.id = l.source_id
+                 JOIN statuses bs ON bs.id = b.status_id
+                WHERE l.target_id = t.id AND l.kind = 'blocks' AND bs.category <> 'done') AS is_blocked,
+       (SELECT count(*) FROM comments cm WHERE cm.ticket_id = t.id) AS comment_count
+  FROM tickets t
+  JOIN projects p ON p.id = t.project_id
+  JOIN statuses s ON s.id = t.status_id";
+
+pub async fn summary(conn: &mut SqliteConnection, id: i64) -> ApiResult<TicketSummary> {
+    let mut qb = QueryBuilder::<Sqlite>::new(SUMMARY_SELECT);
+    qb.push(" WHERE t.id = ").push_bind(id);
+    qb.build_query_as::<TicketSummary>()
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::not_found("Ticket"))
+}
+
+pub async fn summaries(conn: &mut SqliteConnection, ids: &[i64]) -> ApiResult<HashMap<i64, TicketSummary>> {
+    let mut out = HashMap::with_capacity(ids.len());
+    // SQLite caps bound parameters; chunk well under the limit.
+    for chunk in ids.chunks(500) {
+        let mut qb = QueryBuilder::<Sqlite>::new(SUMMARY_SELECT);
+        qb.push(" WHERE t.id IN (");
+        let mut sep = qb.separated(", ");
+        for id in chunk {
+            sep.push_bind(*id);
+        }
+        qb.push(")");
+        for s in qb.build_query_as::<TicketSummary>().fetch_all(&mut *conn).await? {
+            out.insert(s.id, s);
+        }
+    }
+    Ok(out)
+}
+
+/// `"ABC-12"` -> ticket id.
+pub async fn resolve_key(conn: &mut SqliteConnection, key: &str) -> ApiResult<i64> {
+    let missing = || AppError::not_found(format!("Ticket {key}"));
+    let (project, number) = key.rsplit_once('-').ok_or_else(missing)?;
+    let number: i64 = number.parse().map_err(|_| missing())?;
+    sqlx::query_scalar(
+        "SELECT t.id FROM tickets t JOIN projects p ON p.id = t.project_id
+          WHERE p.key = ? AND t.number = ?",
+    )
+    .bind(project.to_ascii_uppercase())
+    .bind(number)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(missing)
+}
+
+pub async fn ticket_key(conn: &mut SqliteConnection, id: i64) -> ApiResult<String> {
+    Ok(sqlx::query_scalar(
+        "SELECT p.key || '-' || t.number FROM tickets t JOIN projects p ON p.id = t.project_id
+          WHERE t.id = ?",
+    )
+    .bind(id)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+pub async fn keys_for(conn: &mut SqliteConnection, ids: &[i64]) -> ApiResult<Vec<String>> {
+    let mut keys = Vec::with_capacity(ids.len());
+    for id in ids {
+        keys.push(ticket_key(conn, *id).await?);
+    }
+    Ok(keys)
+}
+
+pub async fn project_id_by_key(conn: &mut SqliteConnection, key: &str) -> ApiResult<i64> {
+    sqlx::query_scalar("SELECT id FROM projects WHERE key = ?")
+        .bind(key.to_ascii_uppercase())
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Project {key}")))
+}
+
+pub async fn user_name(conn: &mut SqliteConnection, id: Option<i64>) -> ApiResult<String> {
+    let Some(id) = id else { return Ok("Unassigned".into()) };
+    sqlx::query_scalar("SELECT display_name FROM users WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::invalid(format!("User {id} does not exist")))
+}
+
+pub async fn log_activity(
+    conn: &mut SqliteConnection,
+    ticket_id: i64,
+    actor: Option<i64>,
+    action: &str,
+    field: Option<&str>,
+    old: Option<String>,
+    new: Option<String>,
+) -> ApiResult<()> {
+    sqlx::query(
+        "INSERT INTO activity (ticket_id, actor_id, action, field, old_value, new_value, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(ticket_id)
+    .bind(actor)
+    .bind(action)
+    .bind(field)
+    .bind(old)
+    .bind(new)
+    .bind(crate::now_ms())
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Rebuild one ticket's search row from its title, description and comments.
+pub async fn reindex(conn: &mut SqliteConnection, ticket_id: i64) -> ApiResult<()> {
+    sqlx::query("DELETE FROM ticket_fts WHERE rowid = ?").bind(ticket_id).execute(&mut *conn).await?;
+    sqlx::query(
+        "INSERT INTO ticket_fts (rowid, title, description, comments)
+         SELECT t.id, t.title, t.description,
+                COALESCE((SELECT group_concat(body, ' ') FROM comments WHERE ticket_id = t.id), '')
+           FROM tickets t WHERE t.id = ?",
+    )
+    .bind(ticket_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+pub async fn watch(conn: &mut SqliteConnection, ticket_id: i64, user: Option<i64>) -> ApiResult<()> {
+    if let Some(user) = user {
+        sqlx::query("INSERT OR IGNORE INTO ticket_watchers (ticket_id, user_id) VALUES (?, ?)")
+            .bind(ticket_id)
+            .bind(user)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}

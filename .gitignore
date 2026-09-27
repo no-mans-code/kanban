@@ -1,0 +1,7 @@
+node_modules/
+web/dist/
+server/target/
+data/
+*.db
+*.db-shm
+*.db-wal
