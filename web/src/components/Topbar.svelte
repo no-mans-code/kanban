@@ -1,9 +1,9 @@
 <script lang="ts">
   import { router } from '../lib/router.svelte'
   import { app } from '../lib/store.svelte'
+  import AccountMenu from './AccountMenu.svelte'
   import Icon from './Icon.svelte'
   import TicketPicker from './TicketPicker.svelte'
-  import UserPicker from './UserPicker.svelte'
 
   let { title, oncreate, onhelp }: { title: string; oncreate: () => void; onhelp: () => void } = $props()
 </script>
@@ -24,9 +24,8 @@
   <button class="icon-btn" title="Switch to {app.theme === 'dark' ? 'light' : 'dark'} mode (T)" onclick={() => app.toggleTheme()}>
     <Icon name={app.theme === 'dark' ? 'sun' : 'moon'} size={17} />
   </button>
-  <div class="actor" title="Who your changes are attributed to">
-    <span class="as muted">Acting as</span>
-    <UserPicker value={app.actorId} allowNone={false} label="Pick someone" onpick={(id) => app.setActor(id)} />
+  <div class="actor">
+    <AccountMenu />
   </div>
 </header>
 
@@ -83,17 +82,12 @@
     border-left: 1px solid var(--border);
     font-size: 13px;
   }
-  .as {
-    font-size: 12px;
-    white-space: nowrap;
-  }
   .actor :global(.panel) {
     left: auto;
     right: 0;
   }
   @media (max-width: 900px) {
-    .search,
-    .as {
+    .search {
       display: none;
     }
   }

@@ -6,9 +6,9 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::Actor;
-use super::settings::{blocks_edges, max_height};
+use super::settings::{blocks_edges, blocks_edges_visible, max_height};
 use super::tickets::link_label;
+use crate::auth::{Auth, Role};
 use crate::dag::Graph;
 use crate::error::{ApiResult, AppError};
 use crate::models::{
@@ -27,13 +27,17 @@ pub struct LinkBody {
 
 pub async fn create(
     State(state): State<AppState>,
-    Actor(actor): Actor,
+    Auth(p): Auth,
     Json(body): Json<LinkBody>,
 ) -> ApiResult<StatusCode> {
+    p.require_writable()?;
     check_one_of("kind", &body.kind, &LINK_KINDS)?;
     let mut tx = write_tx(&state.db).await?;
     let source = resolve_key(&mut tx, &body.source).await?;
     let target = resolve_key(&mut tx, &body.target).await?;
+    // A link changes both tickets' history, so both need it.
+    p.require_ticket(&mut tx, source, Role::Member).await?;
+    p.require_ticket(&mut tx, target, Role::Member).await?;
     if source == target {
         return Err(AppError::invalid("A ticket cannot link to itself"));
     }
@@ -55,28 +59,18 @@ pub async fn create(
     }
 
     if body.kind == "blocks" {
+        // The check always runs against the TRUE full graph, regardless of
+        // what the caller can see — otherwise an edge that looks safe only
+        // because part of the real graph was hidden could actually create
+        // a real cycle. Only the error MESSAGE is filtered by visibility.
         let graph = Graph::new(&blocks_edges(&mut tx).await?);
         if let Some(cycle) = graph.cycle_if_added(source, target) {
-            let keys = keys_for(&mut tx, &cycle).await?;
-            return Err(AppError::conflict(
-                "cycle",
-                format!("That would create a dependency cycle: {}", keys.join(" → ")),
-            )
-            .with_detail(json!({ "chain": keys })));
+            return Err(cycle_error(&mut tx, &p, &cycle).await?);
         }
         if let Some(limit) = max_height(&mut tx).await? {
             let chain = graph.longest_through(source, target);
             if chain.len() > limit {
-                let keys = keys_for(&mut tx, &chain).await?;
-                return Err(AppError::conflict(
-                    "height_exceeded",
-                    format!(
-                        "That would make a dependency chain of {} tickets, over the limit of {limit}: {}",
-                        chain.len(),
-                        keys.join(" → ")
-                    ),
-                )
-                .with_detail(json!({ "chain": keys, "limit": limit })));
+                return Err(height_error(&mut tx, &p, &chain, limit).await?);
             }
         }
     }
@@ -89,7 +83,7 @@ pub async fn create(
         .bind(now)
         .execute(&mut *tx)
         .await?;
-    record(&mut tx, source, target, &body.kind, actor, "linked").await?;
+    record(&mut tx, source, target, &body.kind, p.user_id, "linked").await?;
     tx.commit().await?;
     state.events.emit(
         "link.changed",
@@ -97,6 +91,54 @@ pub async fn create(
         &[body.source.to_ascii_uppercase(), body.target.to_ascii_uppercase()],
     );
     Ok(StatusCode::CREATED)
+}
+
+/// A cycle/height-limit error naming the full chain, unless it passes
+/// through a project the caller can't see — then the chain is left out
+/// entirely rather than naming tickets that don't officially exist to them.
+async fn cycle_error(
+    conn: &mut sqlx::SqliteConnection,
+    p: &crate::auth::Principal,
+    cycle: &[i64],
+) -> ApiResult<AppError> {
+    if p.sees_all(conn, cycle).await? {
+        let keys = keys_for(conn, cycle).await?;
+        Ok(AppError::conflict("cycle", format!("That would create a dependency cycle: {}", keys.join(" → ")))
+            .with_detail(json!({ "chain": keys })))
+    } else {
+        Ok(AppError::conflict(
+            "cycle",
+            "That would create a dependency cycle through a ticket you don't have access to. Not created.",
+        ))
+    }
+}
+
+async fn height_error(
+    conn: &mut sqlx::SqliteConnection,
+    p: &crate::auth::Principal,
+    chain: &[i64],
+    limit: usize,
+) -> ApiResult<AppError> {
+    if p.sees_all(conn, chain).await? {
+        let keys = keys_for(conn, chain).await?;
+        Ok(AppError::conflict(
+            "height_exceeded",
+            format!(
+                "That would make a dependency chain of {} tickets, over the limit of {limit}: {}",
+                chain.len(),
+                keys.join(" → ")
+            ),
+        )
+        .with_detail(json!({ "chain": keys, "limit": limit })))
+    } else {
+        Ok(AppError::conflict(
+            "height_exceeded",
+            format!(
+                "That would make a dependency chain of {} tickets, over the limit of {limit}, passing through a project you don't have access to. Not created.",
+                chain.len()
+            ),
+        ))
+    }
 }
 
 async fn record(
@@ -125,13 +167,16 @@ async fn record(
 
 pub async fn delete(
     State(state): State<AppState>,
-    Actor(actor): Actor,
+    Auth(p): Auth,
     Query(q): Query<LinkBody>,
 ) -> ApiResult<StatusCode> {
+    p.require_writable()?;
     check_one_of("kind", &q.kind, &LINK_KINDS)?;
     let mut tx = write_tx(&state.db).await?;
     let mut source = resolve_key(&mut tx, &q.source).await?;
     let mut target = resolve_key(&mut tx, &q.target).await?;
+    p.require_ticket(&mut tx, source, Role::Member).await?;
+    p.require_ticket(&mut tx, target, Role::Member).await?;
     let mut removed =
         sqlx::query("DELETE FROM ticket_links WHERE source_id = ? AND target_id = ? AND kind = ?")
             .bind(source)
@@ -153,7 +198,7 @@ pub async fn delete(
     if removed == 0 {
         return Err(AppError::not_found("Link"));
     }
-    record(&mut tx, source, target, &q.kind, actor, "unlinked").await?;
+    record(&mut tx, source, target, &q.kind, p.user_id, "unlinked").await?;
     tx.commit().await?;
     state.events.emit("link.changed", None, &[q.source.to_ascii_uppercase(), q.target.to_ascii_uppercase()]);
     Ok(StatusCode::NO_CONTENT)
@@ -184,26 +229,52 @@ pub struct GraphView {
     nodes: Vec<TicketSummary>,
     edges: Vec<GraphEdge>,
     hierarchy: Vec<HierarchyEdge>,
-    /// Ticket ids on the longest dependency chain across the whole board.
+    /// Ticket ids on the longest dependency chain the caller can see.
     longest_chain: Vec<i64>,
     max_height: Option<usize>,
 }
 
-/// A project's dependency graph. Tickets from other projects that a
-/// project's tickets depend on (or block) are included, so edges never
-/// dangle.
-pub async fn graph(State(state): State<AppState>, Query(q): Query<GraphQuery>) -> ApiResult<Json<GraphView>> {
+/// A project's dependency graph, scoped to what the caller can see. Tickets
+/// from OTHER projects that a project's tickets depend on are included only
+/// when the caller can also see that other project — never a dangling edge
+/// into a project that, to this caller, doesn't exist.
+pub async fn graph(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Query(q): Query<GraphQuery>,
+) -> ApiResult<Json<GraphView>> {
     let mut conn = state.db.acquire().await?;
-    let edges = blocks_edges(&mut conn).await?;
+    let vis = p.visibility(&mut conn).await?;
+    let edges = if p.is_site_admin() {
+        blocks_edges(&mut conn).await?
+    } else {
+        blocks_edges_visible(&mut conn, &p).await?
+    };
+
     let scope: Vec<i64> = match &q.project {
         Some(key) => {
             let pid = project_id_by_key(&mut conn, key).await?;
+            p.require(&mut conn, pid, Role::Viewer).await?;
             sqlx::query_scalar("SELECT id FROM tickets WHERE project_id = ?")
                 .bind(pid)
                 .fetch_all(&mut *conn)
                 .await?
         }
-        None => sqlx::query_scalar("SELECT id FROM tickets").fetch_all(&mut *conn).await?,
+        None => {
+            let mut all = Vec::new();
+            let projects: Vec<i64> =
+                sqlx::query_scalar("SELECT id FROM projects").fetch_all(&mut *conn).await?;
+            for pid in projects {
+                if vis.sees(pid) {
+                    let mut ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM tickets WHERE project_id = ?")
+                        .bind(pid)
+                        .fetch_all(&mut *conn)
+                        .await?;
+                    all.append(&mut ids);
+                }
+            }
+            all
+        }
     };
     let in_scope: HashSet<i64> = scope.iter().copied().collect();
     let mut ids: BTreeSet<i64> = if q.all { scope.iter().copied().collect() } else { BTreeSet::new() };

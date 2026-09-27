@@ -9,6 +9,7 @@ use axum::Router;
 use axum::http::Method;
 use serde_json::{Map, Value, json};
 
+use crate::auth::Principal;
 use crate::inproc::{call, enc};
 
 /// A tool failure the model should see and can act on (shown with isError).
@@ -16,7 +17,12 @@ pub type ToolResult = Result<Value, String>;
 
 pub struct Ctx {
     pub app: Router,
-    pub actor: Option<i64>,
+    /// The MCP caller's real identity and access, exactly as authenticated
+    /// by the bearer token on `/mcp`. Every tool call runs through the same
+    /// HTTP handlers a browser hits, with this attached, so a narrowed
+    /// agent token sees and can only touch what that role allows — the
+    /// scoping lives once, in the handlers, not duplicated here.
+    pub principal: Principal,
 }
 
 pub fn definitions() -> Value {
@@ -270,7 +276,7 @@ impl Names {
 impl Ctx {
     async fn request(&self, method: Method, uri: &str, body: Option<Value>) -> ToolResult {
         let (status, value) =
-            call(&self.app, method, uri, self.actor, body).await.map_err(|e| e.to_string())?;
+            call(&self.app, method, uri, self.principal.clone(), body).await.map_err(|e| e.to_string())?;
         if (200..300).contains(&status) {
             Ok(value)
         } else {
@@ -300,8 +306,8 @@ impl Ctx {
     async fn user_id(&self, who: &str) -> Result<Option<i64>, String> {
         match who.to_ascii_lowercase().as_str() {
             "none" | "unassigned" | "" => Ok(None),
-            "me" => self.actor.map(Some).ok_or_else(|| {
-                "\"me\" needs an acting user: set the X-Kanban-User header (or --as for stdio)".to_string()
+            "me" => self.principal.user_id.map(Some).ok_or_else(|| {
+                "\"me\" needs an authenticated caller, but this API token has no owning user".to_string()
             }),
             name => {
                 let users = self.get("/api/users").await?;

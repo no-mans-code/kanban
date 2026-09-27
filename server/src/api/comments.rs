@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use sqlx::SqliteConnection;
 
-use super::Actor;
+use crate::auth::{Auth, Role};
 use crate::error::{ApiResult, AppError};
 use crate::models::{Comment, log_activity, reindex, resolve_key, watch};
 use crate::{AppState, now_ms, write_tx};
@@ -52,9 +52,14 @@ fn excerpt(body: &str) -> String {
     out
 }
 
-pub async fn list(State(state): State<AppState>, Path(key): Path<String>) -> ApiResult<Json<Vec<Comment>>> {
+pub async fn list(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path(key): Path<String>,
+) -> ApiResult<Json<Vec<Comment>>> {
     let mut conn = state.db.acquire().await?;
     let id = resolve_key(&mut conn, &key).await?;
+    p.require_ticket(&mut conn, id, Role::Viewer).await?;
     let comments = sqlx::query_as::<_, Comment>(
         "SELECT id, ticket_id, author_id, body, created_at, updated_at FROM comments
           WHERE ticket_id = ? ORDER BY id",
@@ -72,13 +77,16 @@ pub struct CommentBody {
 
 pub async fn create(
     State(state): State<AppState>,
-    Actor(actor): Actor,
+    Auth(p): Auth,
     Path(key): Path<String>,
     Json(input): Json<CommentBody>,
 ) -> ApiResult<(StatusCode, Json<Comment>)> {
+    p.require_writable()?;
     let body = clean_body(&input.body)?;
     let mut tx = write_tx(&state.db).await?;
     let ticket_id = resolve_key(&mut tx, &key).await?;
+    p.require_ticket(&mut tx, ticket_id, Role::Member).await?;
+    let actor = p.user_id;
     let now = now_ms();
     let id = sqlx::query(
         "INSERT INTO comments (ticket_id, author_id, body, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
@@ -106,15 +114,36 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(comment)))
 }
 
+/// Only the comment's own author, a project admin, or a site admin may
+/// change or remove it — membership alone isn't enough to edit someone
+/// else's words.
+async fn require_owner_or_admin(
+    conn: &mut SqliteConnection,
+    p: &crate::auth::Principal,
+    comment: &Comment,
+) -> ApiResult<()> {
+    if p.user_id.is_some() && p.user_id == comment.author_id {
+        return Ok(());
+    }
+    let project_id: i64 = sqlx::query_scalar("SELECT project_id FROM tickets WHERE id = ?")
+        .bind(comment.ticket_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    p.require(conn, project_id, Role::Admin).await.map(|_| ())
+}
+
 pub async fn update(
     State(state): State<AppState>,
-    Actor(actor): Actor,
+    Auth(p): Auth,
     Path(id): Path<i64>,
     Json(input): Json<CommentBody>,
 ) -> ApiResult<Json<Comment>> {
+    p.require_writable()?;
     let body = clean_body(&input.body)?;
     let mut tx = write_tx(&state.db).await?;
     let old = load(&mut tx, id).await?;
+    require_owner_or_admin(&mut tx, &p, &old).await?;
+    let actor = p.user_id;
     if old.body != body {
         sqlx::query("UPDATE comments SET body = ?, updated_at = ? WHERE id = ?")
             .bind(&body)
@@ -143,11 +172,14 @@ pub async fn update(
 
 pub async fn delete(
     State(state): State<AppState>,
-    Actor(actor): Actor,
+    Auth(p): Auth,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
+    p.require_writable()?;
     let mut tx = write_tx(&state.db).await?;
     let old = load(&mut tx, id).await?;
+    require_owner_or_admin(&mut tx, &p, &old).await?;
+    let actor = p.user_id;
     sqlx::query("DELETE FROM comments WHERE id = ?").bind(id).execute(&mut *tx).await?;
     log_activity(&mut tx, old.ticket_id, actor, "comment_deleted", None, Some(excerpt(&old.body)), None)
         .await?;

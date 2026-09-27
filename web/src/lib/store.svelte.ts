@@ -1,9 +1,8 @@
-import { api, setActor } from './api'
-import type { ChangeEvent, Label, Project, ProjectDetail, User } from './types'
+import { api, onUnauthorized } from './api'
+import type { ChangeEvent, Label, Me, ProjectDetail, ProjectItem, User } from './types'
 
 const COALESCE_MS = 150
 const THEME_KEY = 'kanban.theme'
-const ACTOR_KEY = 'kanban.actor'
 
 function load(key: string): string | null {
   try {
@@ -24,12 +23,17 @@ function save(key: string, value: string) {
 class AppStore {
   users = $state<User[]>([])
   labels = $state<Label[]>([])
-  projects = $state<Project[]>([])
-  /** The project currently open, with its workflow statuses. */
+  projects = $state<ProjectItem[]>([])
+  /** The project currently open, with its workflow statuses and the caller's role in it. */
   project = $state<ProjectDetail | null>(null)
-  actorId = $state<number | null>(null)
   theme = $state<'dark' | 'light'>(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark')
   connected = $state(false)
+
+  /** The signed-in identity. Null until checked, then null forever means "show the login/setup screen". */
+  me = $state<Me | null>(null)
+  authChecked = $state(false)
+  setupRequired = $state(false)
+  /** True once the post-login app data (users/labels/projects, live updates) has loaded. */
   ready = $state(false)
 
   /**
@@ -48,19 +52,45 @@ class AppStore {
   private pendingTickets = false
   private pendingSettings = false
   private flushTimer: ReturnType<typeof setTimeout> | undefined
+  private events: EventSource | null = null
 
   usersById = $derived(new Map(this.users.map((u) => [u.id, u])))
   labelsById = $derived(new Map(this.labels.map((l) => [l.id, l])))
   activeUsers = $derived(this.users.filter((u) => u.active))
-  actor = $derived(this.actorId === null ? null : (this.usersById.get(this.actorId) ?? null))
+  isSiteAdmin = $derived(this.me?.is_admin ?? false)
 
-  async init() {
+  constructor() {
+    onUnauthorized(() => this.onSignedOut())
+  }
+
+  /** Runs once at startup: figure out whether to show setup, login, or the app. */
+  async checkAuth() {
+    const status = await api.auth.status()
+    this.setupRequired = status.setup_required
+    this.me = status.user
+    this.authChecked = true
+    if (this.me) await this.afterSignIn()
+  }
+
+  async afterSignIn() {
+    if (this.ready) return
     await Promise.all([this.loadUsers(), this.loadLabels(), this.loadProjects()])
-    const saved = Number(load(ACTOR_KEY))
-    const pick = this.users.find((u) => u.id === saved && u.active) ?? this.activeUsers[0] ?? null
-    this.setActor(pick?.id ?? null)
     this.connect()
     this.ready = true
+  }
+
+  private onSignedOut() {
+    this.me = null
+    this.ready = false
+    this.project = null
+    this.events?.close()
+    this.events = null
+    this.connected = false
+  }
+
+  async logout() {
+    await api.auth.logout().catch(() => {})
+    this.onSignedOut()
   }
 
   async loadUsers() {
@@ -84,12 +114,6 @@ class AppStore {
     if (this.project) this.project = await api.project(this.project.key)
   }
 
-  setActor(id: number | null) {
-    this.actorId = id
-    setActor(id)
-    if (id !== null) save(ACTOR_KEY, String(id))
-  }
-
   toggleTheme() {
     this.theme = this.theme === 'dark' ? 'light' : 'dark'
     document.documentElement.dataset.theme = this.theme
@@ -98,6 +122,7 @@ class AppStore {
 
   private connect() {
     const source = new EventSource('/api/events')
+    this.events = source
     source.onopen = () => {
       // After a reconnect we may have missed changes.
       if (!this.connected && this.ready) this.resync()

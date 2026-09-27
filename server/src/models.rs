@@ -66,7 +66,16 @@ pub struct User {
     pub color: String,
     pub active: bool,
     pub created_at: i64,
+    /// human | agent
+    pub kind: String,
+    pub is_admin: bool,
+    /// Whether the account can sign in with a password (never the hash itself).
+    pub has_password: bool,
 }
+
+pub const USER_SELECT: &str = "SELECT id, username, display_name, color, active, created_at, kind, is_admin,
+        password_hash IS NOT NULL AS has_password
+   FROM users";
 
 #[derive(Serialize, FromRow)]
 pub struct Project {

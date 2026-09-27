@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 
 use super::users::clean_color;
+use crate::auth::Auth;
 use crate::error::{ApiResult, AppError};
 use crate::models::{Label, PALETTE};
 use crate::{AppState, write_tx};
@@ -31,8 +32,10 @@ pub struct CreateLabel {
 
 pub async fn create(
     State(state): State<AppState>,
+    Auth(p): Auth,
     Json(body): Json<CreateLabel>,
 ) -> ApiResult<(StatusCode, Json<Label>)> {
+    p.require_writable()?;
     let name = clean_label(&body.name)?;
     let mut tx = write_tx(&state.db).await?;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM labels").fetch_one(&mut *tx).await?;
@@ -59,9 +62,11 @@ pub struct UpdateLabel {
 
 pub async fn update(
     State(state): State<AppState>,
+    Auth(p): Auth,
     Path(id): Path<i64>,
     Json(body): Json<UpdateLabel>,
 ) -> ApiResult<Json<Label>> {
+    p.require_writable()?;
     let mut tx = write_tx(&state.db).await?;
     if let Some(name) = body.name {
         sqlx::query("UPDATE labels SET name = ? WHERE id = ?")
@@ -87,7 +92,12 @@ pub async fn update(
     Ok(Json(label))
 }
 
-pub async fn delete(State(state): State<AppState>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
+pub async fn delete(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    p.require_writable()?;
     let mut tx = write_tx(&state.db).await?;
     let deleted = sqlx::query("DELETE FROM labels WHERE id = ?").bind(id).execute(&mut *tx).await?;
     if deleted.rows_affected() == 0 {

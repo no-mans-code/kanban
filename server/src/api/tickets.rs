@@ -6,7 +6,7 @@ use axum::http::{HeaderName, StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, QueryBuilder, Sqlite, SqliteConnection};
 
-use super::Actor;
+use crate::auth::{Auth, Principal, Role};
 use crate::error::{ApiResult, AppError};
 use crate::models::{
     Activity, PRIORITIES, SUMMARY_SELECT, TYPES, TicketSummary, check_one_of, clean_title, double_option,
@@ -55,8 +55,30 @@ fn fts_query(q: &str) -> Option<String> {
 }
 
 /// The WHERE clause shared by the page query and the count query.
-fn push_filters(qb: &mut QueryBuilder<Sqlite>, q: &ListQuery, parent_id: Option<i64>) -> ApiResult<()> {
+/// `visible_projects`: `Some(ids)` restricts to those projects (possibly
+/// empty, meaning nothing); `None` means the caller sees every project
+/// (a site admin). This is what stops `GET /api/tickets` with no `project`
+/// filter from handing back the whole board to someone who's only a member
+/// of one project — the single most important scoping in this file.
+fn push_filters(
+    qb: &mut QueryBuilder<Sqlite>,
+    q: &ListQuery,
+    parent_id: Option<i64>,
+    visible_projects: Option<&[i64]>,
+) -> ApiResult<()> {
     qb.push(" WHERE 1 = 1");
+    if let Some(ids) = visible_projects {
+        if ids.is_empty() {
+            qb.push(" AND 0");
+        } else {
+            qb.push(" AND t.project_id IN (");
+            let mut sep = qb.separated(", ");
+            for id in ids {
+                sep.push_bind(*id);
+            }
+            qb.push(")");
+        }
+    }
     if let Some(project) = &q.project {
         qb.push(" AND p.key = ").push_bind(project.to_ascii_uppercase());
     }
@@ -105,10 +127,11 @@ fn push_filters(qb: &mut QueryBuilder<Sqlite>, q: &ListQuery, parent_id: Option<
     Ok(())
 }
 
-/// One page of matching tickets. `X-Total-Count` carries the number of
-/// matches across all pages, so a client can tell it has everything.
+/// One page of matching tickets, restricted to projects the caller can see.
+/// `X-Total-Count` carries the number of matches across all pages.
 pub async fn list(
     State(state): State<AppState>,
+    Auth(p): Auth,
     Query(q): Query<ListQuery>,
 ) -> ApiResult<([(HeaderName, String); 1], Json<Vec<TicketSummary>>)> {
     // Every order ends in a unique column so pages never overlap or skip.
@@ -128,17 +151,23 @@ pub async fn list(
         Some(k) => Some(resolve_key(&mut conn, k).await?),
         None => None,
     };
+    let visible = if let Some(project) = &q.project {
+        let pid = project_id_by_key(&mut conn, project).await?;
+        p.require(&mut conn, pid, Role::Viewer).await?;
+        None // the p.key filter below already narrows to this one project
+    } else {
+        p.visibility(&mut conn).await?.ids()
+    };
+    let visible = visible.as_deref();
 
     let mut count = QueryBuilder::<Sqlite>::new(
-        "SELECT count(*) FROM tickets t
-           JOIN projects p ON p.id = t.project_id
-           JOIN statuses s ON s.id = t.status_id",
+        "SELECT count(*) FROM tickets t JOIN projects p ON p.id = t.project_id JOIN statuses s ON s.id = t.status_id",
     );
-    push_filters(&mut count, &q, parent_id)?;
+    push_filters(&mut count, &q, parent_id, visible)?;
     let total: i64 = count.build_query_scalar().fetch_one(&mut *conn).await?;
 
     let mut qb = QueryBuilder::<Sqlite>::new(SUMMARY_SELECT);
-    push_filters(&mut qb, &q, parent_id)?;
+    push_filters(&mut qb, &q, parent_id, visible)?;
     qb.push(order);
     qb.push(" LIMIT ").push_bind(q.limit.unwrap_or(2000).clamp(1, MAX_PAGE));
     qb.push(" OFFSET ").push_bind(q.offset.unwrap_or(0).max(0));
@@ -179,7 +208,14 @@ pub(crate) fn link_label(kind: &str, outward: bool) -> &'static str {
     }
 }
 
-pub async fn load_detail(conn: &mut SqliteConnection, id: i64) -> ApiResult<TicketDetail> {
+/// `p: None` skips visibility filtering, for callers (deletion planning,
+/// in-process seeding) that have already made their own access decision.
+/// Every caller reachable from an HTTP route must pass `Some(principal)`.
+pub async fn load_detail(
+    conn: &mut SqliteConnection,
+    id: i64,
+    p: Option<&Principal>,
+) -> ApiResult<TicketDetail> {
     let summary = summary(conn, id).await?;
     let description: String = sqlx::query_scalar("SELECT description FROM tickets WHERE id = ?")
         .bind(id)
@@ -205,22 +241,32 @@ pub async fn load_detail(conn: &mut SqliteConnection, id: i64) -> ApiResult<Tick
     .await?;
     let others: Vec<i64> = raw.iter().map(|(_, other, _)| *other).collect();
     let found = summaries(conn, &others).await?;
-    let mut links: Vec<LinkView> = raw
-        .into_iter()
-        .filter_map(|(kind, other, outward)| {
-            let ticket = found.get(&other)?.clone();
-            let label = link_label(&kind, outward);
-            Some(LinkView { kind, direction: if outward { "outward" } else { "inward" }, label, ticket })
-        })
-        .collect();
+    // A link into a project the caller can't see is simply left out: it
+    // never names that ticket's title, status or anyone on it.
+    let mut links: Vec<LinkView> = Vec::with_capacity(raw.len());
+    for (kind, other, outward) in raw {
+        let Some(ticket) = found.get(&other).cloned() else { continue };
+        if let Some(p) = p
+            && p.role_in(conn, ticket.project_id).await?.is_none()
+        {
+            continue;
+        }
+        let label = link_label(&kind, outward);
+        links.push(LinkView { kind, direction: if outward { "outward" } else { "inward" }, label, ticket });
+    }
     links.sort_by(|a, b| (a.label, &a.ticket.key).cmp(&(b.label, &b.ticket.key)));
     Ok(TicketDetail { summary, description, watcher_ids, children, links })
 }
 
-pub async fn get(State(state): State<AppState>, Path(key): Path<String>) -> ApiResult<Json<TicketDetail>> {
+pub async fn get(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path(key): Path<String>,
+) -> ApiResult<Json<TicketDetail>> {
     let mut conn = state.db.acquire().await?;
     let id = resolve_key(&mut conn, &key).await?;
-    Ok(Json(load_detail(&mut conn, id).await?))
+    p.require_ticket(&mut conn, id, Role::Viewer).await?;
+    Ok(Json(load_detail(&mut conn, id, Some(&p)).await?))
 }
 
 // ---------------------------------------------------------------- shared helpers
@@ -240,8 +286,7 @@ struct TicketRow {
 
 async fn load_row(conn: &mut SqliteConnection, id: i64) -> ApiResult<TicketRow> {
     Ok(sqlx::query_as::<_, TicketRow>(
-        "SELECT id, project_id, type AS ticket_type, title, description, status_id, priority,
-                assignee_id, parent_id
+        "SELECT id, project_id, type AS ticket_type, title, description, status_id, priority, assignee_id, parent_id
            FROM tickets WHERE id = ?",
     )
     .bind(id)
@@ -272,8 +317,7 @@ fn check_hierarchy(parent: Option<&ParentInfo>, child_type: &str, project_id: i6
             Err(AppError::invalid("A parent ticket must be in the same project"))
         }
         Some(p) if !valid_parent(&p.ticket_type, child_type) => Err(AppError::invalid(format!(
-            "A {child_type} cannot be a child of a {}. Epics hold stories, tasks and bugs; \
-             those hold subtasks.",
+            "A {child_type} cannot be a child of a {}. Epics hold stories, tasks and bugs; those hold subtasks.",
             p.ticket_type
         ))),
         Some(_) => Ok(()),
@@ -385,15 +429,18 @@ pub struct CreateTicket {
 
 pub async fn create(
     State(state): State<AppState>,
-    Actor(actor): Actor,
+    Auth(p): Auth,
     Json(body): Json<CreateTicket>,
 ) -> ApiResult<(StatusCode, Json<TicketDetail>)> {
+    p.require_writable()?;
     let title = clean_title(&body.title)?;
     check_one_of("type", &body.ticket_type, &TYPES)?;
     check_one_of("priority", &body.priority, &PRIORITIES)?;
 
     let mut tx = write_tx(&state.db).await?;
     let project_id = project_id_by_key(&mut tx, &body.project).await?;
+    p.require(&mut tx, project_id, Role::Member).await?;
+    let actor = p.user_id;
     let status_id = match body.status_id {
         Some(s) => s,
         None => {
@@ -426,8 +473,7 @@ pub async fn create(
     let now = now_ms();
     let id = sqlx::query(
         "INSERT INTO tickets (project_id, number, type, title, description, status_id, priority,
-                              assignee_id, reporter_id, parent_id, rank, created_at, updated_at,
-                              resolved_at)
+                              assignee_id, reporter_id, parent_id, rank, created_at, updated_at, resolved_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(project_id)
@@ -457,7 +503,7 @@ pub async fn create(
     }
     log_activity(&mut tx, id, actor, "created", None, None, None).await?;
     reindex(&mut tx, id).await?;
-    let detail = load_detail(&mut tx, id).await?;
+    let detail = load_detail(&mut tx, id, Some(&p)).await?;
     tx.commit().await?;
     state.events.emit("ticket.created", Some(project_id), std::slice::from_ref(&detail.summary.key));
     Ok((StatusCode::CREATED, Json(detail)))
@@ -483,13 +529,16 @@ pub struct UpdateTicket {
 
 pub async fn update(
     State(state): State<AppState>,
-    Actor(actor): Actor,
+    Auth(p): Auth,
     Path(key): Path<String>,
     Json(body): Json<UpdateTicket>,
 ) -> ApiResult<Json<TicketDetail>> {
+    p.require_writable()?;
     let mut tx = write_tx(&state.db).await?;
     let id = resolve_key(&mut tx, &key).await?;
     let row = load_row(&mut tx, id).await?;
+    p.require(&mut tx, row.project_id, Role::Member).await?;
+    let actor = p.user_id;
     let mut changed = false;
     let mut search_dirty = false;
 
@@ -663,7 +712,7 @@ pub async fn update(
     if search_dirty {
         reindex(&mut tx, id).await?;
     }
-    let detail = load_detail(&mut tx, id).await?;
+    let detail = load_detail(&mut tx, id, Some(&p)).await?;
     tx.commit().await?;
     if changed {
         state.events.emit("ticket.updated", Some(row.project_id), std::slice::from_ref(&detail.summary.key));
@@ -701,23 +750,23 @@ async fn place(
             None => None,
         };
         let upper: Option<f64> = match lower {
-            Some(l) => sqlx::query_scalar(
-                "SELECT MIN(rank) FROM tickets WHERE project_id = ? AND status_id = ? AND id <> ? AND rank > ?",
-            )
-            .bind(project_id)
-            .bind(status_id)
-            .bind(me)
-            .bind(l)
-            .fetch_one(&mut *conn)
-            .await?,
-            None => sqlx::query_scalar(
-                "SELECT MIN(rank) FROM tickets WHERE project_id = ? AND status_id = ? AND id <> ?",
-            )
-            .bind(project_id)
-            .bind(status_id)
-            .bind(me)
-            .fetch_one(&mut *conn)
-            .await?,
+            Some(l) => {
+                sqlx::query_scalar("SELECT MIN(rank) FROM tickets WHERE project_id = ? AND status_id = ? AND id <> ? AND rank > ?")
+                    .bind(project_id)
+                    .bind(status_id)
+                    .bind(me)
+                    .bind(l)
+                    .fetch_one(&mut *conn)
+                    .await?
+            }
+            None => {
+                sqlx::query_scalar("SELECT MIN(rank) FROM tickets WHERE project_id = ? AND status_id = ? AND id <> ?")
+                    .bind(project_id)
+                    .bind(status_id)
+                    .bind(me)
+                    .fetch_one(&mut *conn)
+                    .await?
+            }
         };
         match (lower, upper) {
             (None, None) => return Ok(RANK_STEP),
@@ -725,14 +774,13 @@ async fn place(
             (None, Some(u)) => return Ok(u - RANK_STEP),
             (Some(l), Some(u)) if u - l > 1e-6 => return Ok((l + u) / 2.0),
             _ => {
-                let ids: Vec<i64> = sqlx::query_scalar(
-                    "SELECT id FROM tickets WHERE project_id = ? AND status_id = ? AND id <> ? ORDER BY rank, id",
-                )
-                .bind(project_id)
-                .bind(status_id)
-                .bind(me)
-                .fetch_all(&mut *conn)
-                .await?;
+                let ids: Vec<i64> =
+                    sqlx::query_scalar("SELECT id FROM tickets WHERE project_id = ? AND status_id = ? AND id <> ? ORDER BY rank, id")
+                        .bind(project_id)
+                        .bind(status_id)
+                        .bind(me)
+                        .fetch_all(&mut *conn)
+                        .await?;
                 for (i, id) in ids.iter().enumerate() {
                     sqlx::query("UPDATE tickets SET rank = ? WHERE id = ?")
                         .bind((i as f64 + 1.0) * RANK_STEP)
@@ -748,13 +796,15 @@ async fn place(
 
 pub async fn move_ticket(
     State(state): State<AppState>,
-    Actor(actor): Actor,
+    Auth(p): Auth,
     Path(key): Path<String>,
     Json(body): Json<MoveTicket>,
 ) -> ApiResult<Json<TicketSummary>> {
+    p.require_writable()?;
     let mut tx = write_tx(&state.db).await?;
     let id = resolve_key(&mut tx, &key).await?;
     let row = load_row(&mut tx, id).await?;
+    p.require(&mut tx, row.project_id, Role::Member).await?;
     let after = match &body.after {
         Some(k) => {
             let a = resolve_key(&mut tx, k).await?;
@@ -772,7 +822,7 @@ pub async fn move_ticket(
     };
     let status_changed = body.status_id != row.status_id;
     if status_changed {
-        change_status(&mut tx, &row, body.status_id, actor).await?;
+        change_status(&mut tx, &row, body.status_id, p.user_id).await?;
     } else {
         status_in_project(&mut tx, body.status_id, row.project_id).await?;
     }
@@ -807,12 +857,14 @@ async fn watcher_ids(conn: &mut SqliteConnection, ticket_id: i64) -> ApiResult<V
 
 pub async fn add_watcher(
     State(state): State<AppState>,
-    Actor(actor): Actor,
+    Auth(p): Auth,
     Path(key): Path<String>,
     Json(body): Json<WatcherBody>,
 ) -> ApiResult<Json<Vec<i64>>> {
+    p.require_writable()?;
     let mut tx = write_tx(&state.db).await?;
     let id = resolve_key(&mut tx, &key).await?;
+    let project_id = p.require_ticket(&mut tx, id, Role::Member).await?;
     let name = user_name(&mut tx, Some(body.user_id)).await?;
     let added = sqlx::query("INSERT OR IGNORE INTO ticket_watchers (ticket_id, user_id) VALUES (?, ?)")
         .bind(id)
@@ -821,12 +873,8 @@ pub async fn add_watcher(
         .await?
         .rows_affected();
     if added > 0 {
-        log_activity(&mut tx, id, actor, "watcher_added", None, None, Some(name)).await?;
+        log_activity(&mut tx, id, p.user_id, "watcher_added", None, None, Some(name)).await?;
     }
-    let project_id: i64 = sqlx::query_scalar("SELECT project_id FROM tickets WHERE id = ?")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
     let ids = watcher_ids(&mut tx, id).await?;
     tx.commit().await?;
     state.events.emit("ticket.updated", Some(project_id), &[key.to_ascii_uppercase()]);
@@ -835,11 +883,13 @@ pub async fn add_watcher(
 
 pub async fn remove_watcher(
     State(state): State<AppState>,
-    Actor(actor): Actor,
+    Auth(p): Auth,
     Path((key, user_id)): Path<(String, i64)>,
 ) -> ApiResult<Json<Vec<i64>>> {
+    p.require_writable()?;
     let mut tx = write_tx(&state.db).await?;
     let id = resolve_key(&mut tx, &key).await?;
+    let project_id = p.require_ticket(&mut tx, id, Role::Member).await?;
     let removed = sqlx::query("DELETE FROM ticket_watchers WHERE ticket_id = ? AND user_id = ?")
         .bind(id)
         .bind(user_id)
@@ -848,12 +898,8 @@ pub async fn remove_watcher(
         .rows_affected();
     if removed > 0 {
         let name = user_name(&mut tx, Some(user_id)).await?;
-        log_activity(&mut tx, id, actor, "watcher_removed", None, Some(name), None).await?;
+        log_activity(&mut tx, id, p.user_id, "watcher_removed", None, Some(name), None).await?;
     }
-    let project_id: i64 = sqlx::query_scalar("SELECT project_id FROM tickets WHERE id = ?")
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
     let ids = watcher_ids(&mut tx, id).await?;
     tx.commit().await?;
     state.events.emit("ticket.updated", Some(project_id), &[key.to_ascii_uppercase()]);
@@ -862,10 +908,12 @@ pub async fn remove_watcher(
 
 pub async fn activity(
     State(state): State<AppState>,
+    Auth(p): Auth,
     Path(key): Path<String>,
 ) -> ApiResult<Json<Vec<Activity>>> {
     let mut conn = state.db.acquire().await?;
     let id = resolve_key(&mut conn, &key).await?;
+    p.require_ticket(&mut conn, id, Role::Viewer).await?;
     let rows = sqlx::query_as::<_, Activity>(
         "SELECT id, ticket_id, actor_id, action, field, old_value, new_value, created_at
            FROM activity WHERE ticket_id = ? ORDER BY id",

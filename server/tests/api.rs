@@ -2,7 +2,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request};
 use http_body_util::BodyExt;
-use kanban_server::{AppState, events::Events, open_db, router};
+use kanban_server::auth::Principal;
+use kanban_server::{AppState, open_db, router};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
@@ -15,18 +16,24 @@ impl TestApp {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let db = open_db(&dir.path().join("test.db")).await.unwrap();
-        let app = router(AppState { db, events: Events::default() });
+        let app = router(AppState::new(db));
         TestApp { app, _dir: dir }
     }
 
+    /// These tests exercise ticket/project business logic, not the auth
+    /// layer itself (that's tests/auth.rs, over real bearer tokens and
+    /// cookies). So every request here runs as a full-access principal
+    /// attached directly — the same mechanism `inproc::call` uses for
+    /// in-process callers — acting as whichever user "setup()" creates
+    /// first (id 1, "me"), matching how these tests were written.
     async fn req(&self, method: Method, uri: &str, body: Option<Value>) -> (u16, Value) {
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method(method)
             .uri(uri)
             .header("content-type", "application/json")
-            .header("x-actor", "1")
             .body(body.map(|b| Body::from(b.to_string())).unwrap_or_default())
             .unwrap();
+        req.extensions_mut().insert(Principal::acting_as(1));
         let res = self.app.clone().oneshot(req).await.unwrap();
         let status = res.status().as_u16();
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
@@ -302,13 +309,19 @@ async fn validation_errors_are_json() {
     assert_eq!(status, 404);
 }
 
+/// The host guard runs before authentication (see `router()`), so this
+/// attaches a valid, full-access principal directly (bypassing the header
+/// auth this test isn't about) to prove the guard rejects a bad Host/Origin
+/// even for an otherwise fully authorized request.
 async fn with_headers(t: &TestApp, method: Method, uri: &str, headers: &[(&str, &str)]) -> u16 {
     let mut req = Request::builder().method(method).uri(uri).header("content-type", "application/json");
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
     let body = Body::from(json!({ "username": "probe" }).to_string());
-    t.app.clone().oneshot(req.body(body).unwrap()).await.unwrap().status().as_u16()
+    let mut req = req.body(body).unwrap();
+    req.extensions_mut().insert(Principal::acting_as(1));
+    t.app.clone().oneshot(req).await.unwrap().status().as_u16()
 }
 
 #[tokio::test]
@@ -331,7 +344,8 @@ async fn foreign_hosts_and_origins_are_rejected() {
 }
 
 async fn page(t: &TestApp, uri: &str) -> (Vec<String>, i64) {
-    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let mut req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    req.extensions_mut().insert(Principal::acting_as(1));
     let res = t.app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), 200);
     let total = res.headers()["x-total-count"].to_str().unwrap().parse().unwrap();

@@ -5,6 +5,8 @@
   import ListView from './components/ListView.svelte'
   import Overlays from './components/Overlays.svelte'
   import SettingsView from './components/SettingsView.svelte'
+  import LoginView from './components/LoginView.svelte'
+  import SetupView from './components/SetupView.svelte'
   import Sidebar from './components/Sidebar.svelte'
   import TicketPanel from './components/TicketPanel.svelte'
   import Topbar from './components/Topbar.svelte'
@@ -28,7 +30,7 @@
   const route = $derived(router.route)
 
   onMount(() => {
-    app.init().catch((e) => (failed = e instanceof Error ? e.message : String(e)))
+    app.checkAuth().catch((e) => (failed = e instanceof Error ? e.message : String(e)))
   })
 
   // Open the project named in the URL; send "/" to the first project.
@@ -138,45 +140,53 @@
 <svelte:window onkeydown={onKeydown} />
 <svelte:document onclick={onClick} />
 
-<div class="app">
-  <Sidebar />
-  <main>
-    <Topbar {title} oncreate={() => (showCreate = true)} onhelp={() => (showShortcuts = true)} />
-    {#if failed}
-      <div class="notice">
-        <h2>Can't reach the board server</h2>
-        <p class="muted">{failed}</p>
-        <button class="btn" onclick={() => location.reload()}>Retry</button>
-      </div>
-    {:else if !app.ready}
-      <div class="notice muted">Loading…</div>
-    {:else if route.name === 'settings'}
-      <SettingsView tab={route.tab} />
-    {:else if route.name === 'project' && app.project?.key === route.project}
-      {#if route.view === 'board'}
-        <BoardView project={app.project} />
-      {:else if route.view === 'list'}
-        <ListView project={app.project} />
-      {:else}
-        {#await loadGraphView() then GraphView}
-          <GraphView project={app.project} />
-        {:catch e}
-          <div class="notice muted">Couldn't load the graph view: {e}</div>
-        {/await}
+{#if failed}
+  <div class="notice">
+    <h2>Can't reach the board server</h2>
+    <p class="muted">{failed}</p>
+    <button class="btn" onclick={() => location.reload()}>Retry</button>
+  </div>
+{:else if !app.authChecked}
+  <div class="notice muted">Loading…</div>
+{:else if app.setupRequired}
+  <SetupView />
+{:else if !app.me}
+  <LoginView />
+{:else}
+  <div class="app">
+    <Sidebar />
+    <main>
+      <Topbar {title} oncreate={() => (showCreate = true)} onhelp={() => (showShortcuts = true)} />
+      {#if !app.ready}
+        <div class="notice muted">Loading…</div>
+      {:else if route.name === 'settings'}
+        <SettingsView tab={route.tab} />
+      {:else if route.name === 'project' && app.project?.key === route.project}
+        {#if route.view === 'board'}
+          <BoardView project={app.project} />
+        {:else if route.view === 'list'}
+          <ListView project={app.project} />
+        {:else}
+          {#await loadGraphView() then GraphView}
+            <GraphView project={app.project} />
+          {:catch e}
+            <div class="notice muted">Couldn't load the graph view: {e}</div>
+          {/await}
+        {/if}
+      {:else if app.projects.length === 0}
+        <Welcome />
       {/if}
-    {:else if app.projects.length === 0}
-      <Welcome />
-    {/if}
-  </main>
-</div>
+    </main>
+  </div>
 
-{#if router.ticket}
-  <TicketPanel ticketKey={router.ticket} />
+  {#if router.ticket}
+    <TicketPanel ticketKey={router.ticket} />
+  {/if}
+  {#if showCreate}
+    <CreateTicket onclose={() => (showCreate = false)} />
+  {/if}
+  <Overlays bind:showShortcuts />
 {/if}
-{#if showCreate}
-  <CreateTicket onclose={() => (showCreate = false)} />
-{/if}
-<Overlays bind:showShortcuts />
 
 <style>
   .app {

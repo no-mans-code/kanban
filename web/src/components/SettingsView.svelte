@@ -3,19 +3,24 @@
   import { projectUrl, router } from '../lib/router.svelte'
   import { app } from '../lib/store.svelte'
   import { confirmer, toasts } from '../lib/toast.svelte'
-  import { CATEGORIES, CATEGORY_NAMES, type Label, type ProjectDetail, type Settings, type Status, type User } from '../lib/types'
-  import Avatar from './Avatar.svelte'
+  import { CATEGORIES, CATEGORY_NAMES, type Label, type ProjectDetail, type Settings, type Status } from '../lib/types'
+  import ProjectMembers from './ProjectMembers.svelte'
+  import PeoplePanel from './settings/PeoplePanel.svelte'
+  import TokensPanel from './settings/TokensPanel.svelte'
   import Icon from './Icon.svelte'
 
   let { tab }: { tab: string } = $props()
 
-  const TABS: [string, string][] = [
-    ['general', 'General'],
-    ['workflow', 'Workflow'],
-    ['labels', 'Labels'],
-    ['people', 'People'],
-    ['projects', 'Projects'],
-  ]
+  const TABS = $derived(
+    [
+      ['general', 'General'],
+      ['workflow', 'Workflow'],
+      ['labels', 'Labels'],
+      ['tokens', 'Tokens'],
+      app.isSiteAdmin ? ['people', 'People'] : null,
+      ['projects', 'Projects'],
+    ].filter((t): t is [string, string] => t !== null),
+  )
 
   // ------------------------------------------------ general
   let settings = $state<Settings | null>(null)
@@ -49,6 +54,7 @@
   let wf = $state<ProjectDetail | null>(null)
   let newStatus = $state('')
   let newCategory = $state<Status['category']>('in_progress')
+  const canEditWorkflow = $derived(wf?.role === 'admin')
 
   $effect(() => {
     void app.ticketsVersion
@@ -131,32 +137,10 @@
       labelCall(() => api.deleteLabel(l.id))
   }
 
-  // ------------------------------------------------ people
-  let newUsername = $state('')
-  let newDisplay = $state('')
-
-  async function userCall(fn: () => Promise<unknown>) {
-    try {
-      await fn()
-      await app.loadUsers()
-    } catch (e) {
-      toasts.error(e)
-    }
-  }
-
-  function addUser() {
-    const username = newUsername.trim()
-    if (!username) return
-    userCall(async () => {
-      await api.createUser({ username, display_name: newDisplay.trim() || undefined })
-      newUsername = ''
-      newDisplay = ''
-    })
-  }
-
   // ------------------------------------------------ projects
   let pKey = $state('')
   let pName = $state('')
+  let expanded = $state<string | null>(null)
 
   async function createProject() {
     try {
@@ -194,24 +178,28 @@
         Limit how deep chains of <em>blocks</em> links can get. Height counts the tickets on the longest chain, so
         <span class="key">A → B → C</span> has height 3. The limit applies to every project.
       </p>
-      <div class="card">
-        <label class="radio"><input type="radio" bind:group={unlimited} value={true} /> No limit (default)</label>
-        <label class="radio">
-          <input type="radio" bind:group={unlimited} value={false} /> At most
-          <input class="input num" type="number" min="1" bind:value={limit} disabled={unlimited} onfocus={() => (unlimited = false)} />
-          tickets per chain
-        </label>
-        <div class="actions">
-          <button class="btn btn-primary" onclick={saveLimit}>Save</button>
+      {#if app.isSiteAdmin}
+        <div class="card">
+          <label class="radio"><input type="radio" bind:group={unlimited} value={true} /> No limit (default)</label>
+          <label class="radio">
+            <input type="radio" bind:group={unlimited} value={false} /> At most
+            <input class="input num" type="number" min="1" bind:value={limit} disabled={unlimited} onfocus={() => (unlimited = false)} />
+            tickets per chain
+          </label>
+          <div class="actions">
+            <button class="btn btn-primary" onclick={saveLimit}>Save</button>
+          </div>
+          {#if limitError}<p class="error">{limitError}</p>{/if}
         </div>
-        {#if limitError}<p class="error">{limitError}</p>{/if}
-      </div>
+      {:else}
+        <p class="muted">Only a site administrator can change this. Ask yours if it needs to be different.</p>
+      {/if}
       {#if settings}
         <p class="now">
           {#if settings.dag_height === 0}
-            There are no dependency chains yet.
+            {settings.is_site_admin ? 'There are no dependency chains yet.' : "There are no dependency chains in projects you can see yet."}
           {:else}
-            The longest chain today has <strong>{settings.dag_height}</strong> tickets:
+            The longest chain {settings.is_site_admin ? '' : 'you can see '}today has <strong>{settings.dag_height}</strong> tickets:
             {#each settings.longest_chain as k, i (k)}
               <a class="key" href="?ticket={k}">{k}</a>{#if i < settings.longest_chain.length - 1}<span class="muted"> → </span>{/if}
             {/each}
@@ -228,6 +216,9 @@
           {#each app.projects as p (p.key)}<option value={p.key}>{p.name} ({p.key})</option>{/each}
         </select>
       </label>
+      {#if wf && !canEditWorkflow}
+        <p class="muted">You need to be an admin of {wf.key} to change its workflow. You have {wf.role} access.</p>
+      {/if}
       {#if wf}
         <div class="rows">
           {#each wf.statuses as s, i (s.id)}
@@ -236,29 +227,35 @@
               <input
                 class="input grow"
                 value={s.name}
+                disabled={!canEditWorkflow}
                 onchange={(e) => wfCall(() => api.updateStatus(s.id, { name: e.currentTarget.value }))}
                 aria-label="Status name"
               />
               <select
                 class="select cat"
                 value={s.category}
+                disabled={!canEditWorkflow}
                 onchange={(e) => wfCall(() => api.updateStatus(s.id, { category: e.currentTarget.value }))}
                 aria-label="Category"
               >
                 {#each CATEGORIES as c (c)}<option value={c}>{CATEGORY_NAMES[c]}</option>{/each}
               </select>
-              <button class="icon-btn" title="Move left" disabled={i === 0} onclick={() => move(i, -1)}><Icon name="up" size={14} /></button>
-              <button class="icon-btn" title="Move right" disabled={i === wf.statuses.length - 1} onclick={() => move(i, 1)}><Icon name="down" size={14} /></button>
-              <button class="icon-btn" title="Delete" disabled={wf.statuses.length === 1} onclick={() => deleteStatus(s, i)}><Icon name="trash" size={14} /></button>
+              {#if canEditWorkflow}
+                <button class="icon-btn" title="Move left" disabled={i === 0} onclick={() => move(i, -1)}><Icon name="up" size={14} /></button>
+                <button class="icon-btn" title="Move right" disabled={i === wf.statuses.length - 1} onclick={() => move(i, 1)}><Icon name="down" size={14} /></button>
+                <button class="icon-btn" title="Delete" disabled={wf.statuses.length === 1} onclick={() => deleteStatus(s, i)}><Icon name="trash" size={14} /></button>
+              {/if}
             </div>
           {/each}
-          <div class="row add">
-            <input class="input grow" placeholder="New status" bind:value={newStatus} onkeydown={(e) => e.key === 'Enter' && addStatus()} />
-            <select class="select cat" bind:value={newCategory} aria-label="Category">
-              {#each CATEGORIES as c (c)}<option value={c}>{CATEGORY_NAMES[c]}</option>{/each}
-            </select>
-            <button class="btn" disabled={!newStatus.trim()} onclick={addStatus}>Add</button>
-          </div>
+          {#if canEditWorkflow}
+            <div class="row add">
+              <input class="input grow" placeholder="New status" bind:value={newStatus} onkeydown={(e) => e.key === 'Enter' && addStatus()} />
+              <select class="select cat" bind:value={newCategory} aria-label="Category">
+                {#each CATEGORIES as c (c)}<option value={c}>{CATEGORY_NAMES[c]}</option>{/each}
+              </select>
+              <button class="btn" disabled={!newStatus.trim()} onclick={addStatus}>Add</button>
+            </div>
+          {/if}
         </div>
       {/if}
 
@@ -279,49 +276,47 @@
         </div>
       </div>
 
-    {:else if tab === 'people'}
-      <h2>People</h2>
-      <p class="lead">
-        Everyone who can be assigned or watch tickets, humans and agents alike. There are no passwords: the board
-        only listens on this machine, and you pick who you're acting as in the top right.
-      </p>
-      <div class="rows">
-        {#each app.users as u (u.id) }
-          <div class="row" class:inactive={!u.active}>
-            <Avatar userId={u.id} size={28} />
-            <input class="input grow" value={u.display_name} onchange={(e) => userCall(() => api.updateUser(u.id, { display_name: e.currentTarget.value }))} aria-label="Display name" />
-            <span class="muted user">@{u.username}</span>
-            <input type="color" class="swatch" value={u.color} onchange={(e) => userCall(() => api.updateUser(u.id, { color: e.currentTarget.value }))} aria-label="Color" />
-            <button class="btn btn-sm" onclick={() => userCall(() => api.updateUser(u.id, { active: !u.active }))}>
-              {u.active ? 'Deactivate' : 'Reactivate'}
-            </button>
-          </div>
-        {/each}
-        <div class="row add">
-          <input class="input" placeholder="username" bind:value={newUsername} />
-          <input class="input grow" placeholder="Display name (optional)" bind:value={newDisplay} onkeydown={(e) => e.key === 'Enter' && addUser()} />
-          <button class="btn" disabled={!newUsername.trim()} onclick={addUser}>Add person</button>
-        </div>
-      </div>
+    {:else if tab === 'tokens'}
+      <TokensPanel />
+
+    {:else if tab === 'people' && app.isSiteAdmin}
+      <PeoplePanel />
 
     {:else if tab === 'projects'}
       <h2>Projects</h2>
       <div class="rows">
         {#each app.projects as p (p.key)}
-          <div class="row">
-            <span class="key pkey">{p.key}</span>
-            <input class="input grow" value={p.name} onchange={(e) => renameProject(p.key, e.currentTarget.value)} aria-label="Project name" />
-            <a class="btn btn-sm" href={projectUrl(p.key)}>Open</a>
+          <div class="proj">
+            <div class="row">
+              <button class="icon-btn" title={expanded === p.key ? 'Hide members' : 'Show members'} onclick={() => (expanded = expanded === p.key ? null : p.key)}>
+                <Icon name={expanded === p.key ? 'chevron-down' : 'chevron'} size={13} />
+              </button>
+              <span class="key pkey">{p.key}</span>
+              <input
+                class="input grow"
+                value={p.name}
+                disabled={p.role !== 'admin'}
+                onchange={(e) => renameProject(p.key, e.currentTarget.value)}
+                aria-label="Project name"
+              />
+              <span class="chip role">{p.role}</span>
+              <a class="btn btn-sm" href={projectUrl(p.key)}>Open</a>
+            </div>
+            {#if expanded === p.key}<ProjectMembers projectKey={p.key} />{/if}
           </div>
         {/each}
       </div>
-      <h3>New project</h3>
-      <div class="row add">
-        <input class="input pk" placeholder="KEY" maxlength="10" bind:value={pKey} oninput={() => (pKey = pKey.toUpperCase())} />
-        <input class="input grow" placeholder="Project name" bind:value={pName} onkeydown={(e) => e.key === 'Enter' && createProject()} />
-        <button class="btn btn-primary" disabled={!pKey.trim() || !pName.trim()} onclick={createProject}>Create</button>
-      </div>
-      <p class="muted small">The key prefixes every ticket number, like {pKey || 'KEY'}-1. 2-10 letters or digits, starting with a letter.</p>
+      {#if app.isSiteAdmin}
+        <h3>New project</h3>
+        <div class="row add">
+          <input class="input pk" placeholder="KEY" maxlength="10" bind:value={pKey} oninput={() => (pKey = pKey.toUpperCase())} />
+          <input class="input grow" placeholder="Project name" bind:value={pName} onkeydown={(e) => e.key === 'Enter' && createProject()} />
+          <button class="btn btn-primary" disabled={!pKey.trim() || !pName.trim()} onclick={createProject}>Create</button>
+        </div>
+        <p class="muted small">The key prefixes every ticket number, like {pKey || 'KEY'}-1. 2-10 letters or digits, starting with a letter.</p>
+      {:else}
+        <p class="muted small">Only a site administrator can create new projects.</p>
+      {/if}
     {/if}
   </div>
 </div>
@@ -422,9 +417,6 @@
   .row.add {
     margin-top: 8px;
   }
-  .row.inactive {
-    opacity: 0.55;
-  }
   .grow {
     flex: 1;
   }
@@ -447,10 +439,6 @@
     background: var(--surface);
     cursor: pointer;
   }
-  .user {
-    font-size: 12px;
-    width: 110px;
-  }
   .pkey {
     width: 70px;
   }
@@ -461,8 +449,16 @@
   .small {
     font-size: 12px;
   }
+  .role {
+    text-transform: capitalize;
+  }
   .icon-btn:disabled {
     opacity: 0.3;
     cursor: default;
+  }
+  input:disabled,
+  select:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 </style>

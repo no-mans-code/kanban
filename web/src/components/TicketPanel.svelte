@@ -48,7 +48,8 @@
       (l) => l.kind === 'blocks' && l.direction === 'inward' && l.ticket.status_category !== 'done',
     ),
   )
-  const watching = $derived(app.actorId !== null && (detail?.watcher_ids.includes(app.actorId) ?? false))
+  const myId = $derived(app.me?.id ?? null)
+  const watching = $derived(myId !== null && (detail?.watcher_ids.includes(myId) ?? false))
 
   async function load(key: string) {
     try {
@@ -148,7 +149,7 @@
   }
 
   function toggleWatch() {
-    if (app.actorId !== null) setWatching(app.actorId, !watching)
+    if (myId !== null) setWatching(myId, !watching)
   }
 
   function copyLink() {

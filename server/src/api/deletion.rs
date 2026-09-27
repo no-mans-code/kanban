@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqliteConnection;
 
-use super::Actor;
 use super::settings::{blocks_edges, max_height};
 use super::tickets::link_label;
+use crate::auth::{Auth, Principal, Role};
 use crate::dag::Graph;
 use crate::error::{ApiResult, AppError};
 use crate::models::{TicketSummary, keys_for, log_activity, resolve_key, summaries, summary, valid_parent};
@@ -160,10 +160,57 @@ pub async fn build_plan(conn: &mut SqliteConnection, id: i64) -> ApiResult<Delet
     })
 }
 
-pub async fn plan(State(state): State<AppState>, Path(key): Path<String>) -> ApiResult<Json<DeletePlan>> {
+/// Every ticket this plan would name in a response, besides the ones being
+/// deleted (whose own visibility was already checked by the caller).
+fn referenced(plan: &DeletePlan, doomed: &BTreeSet<i64>) -> Vec<i64> {
+    plan.blockers
+        .iter()
+        .chain(plan.dependents.iter().map(|d| &d.ticket))
+        .chain(plan.children_dependents.iter())
+        .chain(plan.other_links.iter().map(|l| &l.ticket))
+        .map(|t| t.id)
+        .chain(plan.parent.as_ref().map(|p| p.id))
+        .filter(|id| !doomed.contains(id))
+        .collect()
+}
+
+/// The dependency graph is board-wide, so a ticket's blockers, dependents or
+/// other links can sit in a project the caller can't see. Rather than
+/// silently drop them from the plan (which could then let a rewire connect
+/// tickets the caller never saw), refuse outright and say why. Deletion is
+/// rare and destructive enough that this friction is the right trade.
+async fn check_visible(conn: &mut SqliteConnection, p: &Principal, plan: &DeletePlan) -> ApiResult<()> {
+    let mut doomed = BTreeSet::from([plan.ticket.id]);
+    doomed.extend(plan.children.iter().map(|c| c.id));
+    doomed.extend(plan.grandchildren.iter().map(|g| g.id));
+    let ids = referenced(plan, &doomed);
+    if ids.is_empty() || p.sees_all(conn, &ids).await? {
+        return Ok(());
+    }
+    Err(AppError::new(
+        axum::http::StatusCode::FORBIDDEN,
+        "cross_project_dependency",
+        format!(
+            "{} has a dependency or link in a project you don't have access to, so it can't be safely \
+             deleted from here. Ask an administrator of that project, or a site admin.",
+            plan.ticket.key
+        ),
+    ))
+}
+
+pub async fn plan(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path(key): Path<String>,
+) -> ApiResult<Json<DeletePlan>> {
     let mut conn = state.db.acquire().await?;
     let id = resolve_key(&mut conn, &key).await?;
-    Ok(Json(build_plan(&mut conn, id).await?))
+    // Previewing requires the same access deleting would: a plan for a
+    // ticket you can't delete would just be a way to browse it anyway.
+    p.require_ticket(&mut conn, id, Role::Admin).await?;
+    let plan = build_plan(&mut conn, id).await?;
+    check_visible(&mut conn, &p, &plan).await?;
+    Ok(Json(plan))
 }
 
 #[derive(Deserialize)]
@@ -230,13 +277,17 @@ async fn make_task(conn: &mut SqliteConnection, child: &TicketSummary, actor: Op
 
 pub async fn delete(
     State(state): State<AppState>,
-    Actor(actor): Actor,
+    Auth(p): Auth,
     Path(key): Path<String>,
     Query(q): Query<Decisions>,
 ) -> ApiResult<StatusCode> {
+    p.require_writable()?;
     let mut tx = write_tx(&state.db).await?;
     let id = resolve_key(&mut tx, &key).await?;
+    p.require_ticket(&mut tx, id, Role::Admin).await?;
+    let actor = p.user_id;
     let plan = build_plan(&mut tx, id).await?;
+    check_visible(&mut tx, &p, &plan).await?;
     let children_choice = decide("children", q.children.as_deref(), &plan.children_options, &plan)?;
     let dependents_choice = decide("dependents", q.dependents.as_deref(), &plan.dependents_options, &plan)?;
     let x = &plan.ticket;
@@ -263,6 +314,7 @@ pub async fn delete(
             let target_key =
                 q.move_to.as_deref().ok_or_else(|| AppError::invalid("children=move needs move_to=KEY"))?;
             let target_id = resolve_key(&mut tx, target_key).await?;
+            p.require_ticket(&mut tx, target_id, Role::Member).await?;
             let target = summary(&mut tx, target_id).await?;
             if target.id == x.id || plan.children.iter().any(|c| c.id == target.id) {
                 return Err(AppError::invalid("move_to must be a ticket outside the one being deleted"));
@@ -317,6 +369,7 @@ pub async fn delete(
             if doomed.contains(&target) {
                 return Err(AppError::invalid("transfer_to must be a ticket that isn't being deleted"));
             }
+            p.require_ticket(&mut tx, target, Role::Member).await?;
             vec![target]
         }
         _ => Vec::new(),
@@ -337,29 +390,57 @@ pub async fn delete(
                 }
                 let graph = Graph::new(&edges);
                 if let Some(cycle) = graph.cycle_if_added(source, dependent.id) {
-                    let keys = keys_for(&mut tx, &cycle).await?;
-                    return Err(AppError::conflict(
-                        "cycle",
-                        format!(
-                            "Nothing was deleted: that would create a dependency cycle: {}",
-                            keys.join(" → ")
-                        ),
-                    )
-                    .with_detail(json!({ "chain": keys })));
+                    // This cycle can pass through a ticket that was never in
+                    // the plan (a third party reachable in the real global
+                    // graph), so it needs its own visibility check.
+                    let detail = if p.sees_all(&mut tx, &cycle).await? {
+                        let keys = keys_for(&mut tx, &cycle).await?;
+                        Some((
+                            format!(
+                                "Nothing was deleted: that would create a dependency cycle: {}",
+                                keys.join(" → ")
+                            ),
+                            Some(keys),
+                        ))
+                    } else {
+                        None
+                    };
+                    let (message, keys) = detail.unwrap_or_else(|| {
+                        ("Nothing was deleted: that rewiring would create a dependency cycle through a ticket you don't have access to.".into(), None)
+                    });
+                    let mut err = AppError::conflict("cycle", message);
+                    if let Some(keys) = keys {
+                        err = err.with_detail(json!({ "chain": keys }));
+                    }
+                    return Err(err);
                 }
                 if let Some(limit) = limit {
                     let chain = graph.longest_through(source, dependent.id);
                     if chain.len() > limit {
-                        let keys = keys_for(&mut tx, &chain).await?;
-                        return Err(AppError::conflict(
-                            "height_exceeded",
-                            format!(
-                                "Nothing was deleted: that would make a dependency chain of {} tickets, over the limit of {limit}: {}",
-                                chain.len(),
-                                keys.join(" → ")
-                            ),
-                        )
-                        .with_detail(json!({ "chain": keys, "limit": limit })));
+                        let (message, keys) = if p.sees_all(&mut tx, &chain).await? {
+                            let keys = keys_for(&mut tx, &chain).await?;
+                            (
+                                format!(
+                                    "Nothing was deleted: that would make a dependency chain of {} tickets, over the limit of {limit}: {}",
+                                    chain.len(),
+                                    keys.join(" → ")
+                                ),
+                                Some(keys),
+                            )
+                        } else {
+                            (
+                                format!(
+                                    "Nothing was deleted: that rewiring would make a dependency chain of {} tickets, over the limit of {limit}, through a ticket you don't have access to.",
+                                    chain.len()
+                                ),
+                                None,
+                            )
+                        };
+                        let mut err = AppError::conflict("height_exceeded", message);
+                        if let Some(keys) = keys {
+                            err = err.with_detail(json!({ "chain": keys, "limit": limit }));
+                        }
+                        return Err(err);
                     }
                 }
                 edges.push(edge);

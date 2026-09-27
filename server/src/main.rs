@@ -3,7 +3,8 @@ use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kanban_server::{AppState, demo, events::Events, mcp, open_db, router};
+use kanban_server::auth::new_setup_code;
+use kanban_server::{AppState, demo, mcp, open_db, router};
 use tracing_subscriber::EnvFilter;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -40,10 +41,15 @@ async fn main() -> anyhow::Result<()> {
         let url = value("--url")
             .or_else(|| std::env::var("KANBAN_MCP_URL").ok())
             .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
-        let user = value("--as").or_else(|| std::env::var("KANBAN_MCP_USER").ok());
+        let token = value("--token").or_else(|| std::env::var("KANBAN_MCP_TOKEN").ok()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no API token given. Pass --token kbn_... or set KANBAN_MCP_TOKEN. \
+                 Create one for your account from the board's Settings > Tokens page."
+            )
+        })?;
         let target = mcp::bridge::Target::parse(&url).map_err(anyhow::Error::msg)?;
         let stdin = std::io::stdin().lock();
-        mcp::bridge::run(stdin, std::io::stdout().lock(), &target, user.as_deref())?;
+        mcp::bridge::run(stdin, std::io::stdout().lock(), &target, &token)?;
         return Ok(());
     }
 
@@ -58,15 +64,23 @@ async fn main() -> anyhow::Result<()> {
     let ip: IpAddr = env_or("KANBAN_BIND", "127.0.0.1").parse()?;
     if !ip.is_loopback() {
         tracing::warn!(
-            "binding to {ip}: this board has no authentication, anyone who can reach it can edit it"
+            "binding to {ip}: make sure KANBAN_ALLOWED_HOSTS is set, and that you understand every account's password/token reaches this address"
         );
     }
 
     let db = open_db(&db_path).await?;
-    let app = router(AppState { db, events: Events::default() });
+    let mut state = AppState::new(db);
+    state.cookie_secure = env_or("KANBAN_COOKIE_SECURE", "0") == "1";
+    let app = router(state.clone());
     demo::bootstrap(&app).await?;
     if seed_demo {
         demo::seed(&app).await?;
+    }
+
+    if kanban_server::auth::setup_required(&state.db).await {
+        let code = new_setup_code();
+        *state.setup_code.lock().expect("setup code lock") = Some(code.clone());
+        tracing::warn!("no administrator yet — open the board and enter this one-time setup code: {code}");
     }
 
     let addr = SocketAddr::new(ip, port);

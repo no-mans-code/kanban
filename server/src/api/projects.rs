@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use sqlx::SqliteConnection;
 
-use super::Actor;
+use crate::auth::{Auth, Principal, Role};
 use crate::error::{ApiResult, AppError};
 use crate::models::{CATEGORIES, Project, Status, check_one_of, log_activity, project_id_by_key};
 use crate::{AppState, now_ms, write_tx};
@@ -19,6 +19,15 @@ pub struct ProjectDetail {
     #[serde(flatten)]
     project: Project,
     statuses: Vec<Status>,
+    /// The caller's role here: viewer | member | admin.
+    role: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct ProjectItem {
+    #[serde(flatten)]
+    project: Project,
+    role: &'static str,
 }
 
 async fn load_statuses(conn: &mut SqliteConnection, project_id: i64) -> ApiResult<Vec<Status>> {
@@ -31,7 +40,8 @@ async fn load_statuses(conn: &mut SqliteConnection, project_id: i64) -> ApiResul
     .await?)
 }
 
-async fn load_detail(conn: &mut SqliteConnection, project_id: i64) -> ApiResult<ProjectDetail> {
+/// Caller must already be known to have `role` here (checked by the caller).
+async fn load_detail(conn: &mut SqliteConnection, project_id: i64, role: Role) -> ApiResult<ProjectDetail> {
     let project = sqlx::query_as::<_, Project>(
         "SELECT id, key, name, description, created_at FROM projects WHERE id = ?",
     )
@@ -39,16 +49,26 @@ async fn load_detail(conn: &mut SqliteConnection, project_id: i64) -> ApiResult<
     .fetch_one(&mut *conn)
     .await?;
     let statuses = load_statuses(conn, project_id).await?;
-    Ok(ProjectDetail { project, statuses })
+    Ok(ProjectDetail { project, statuses, role: role.as_str() })
 }
 
-pub async fn list(State(state): State<AppState>) -> ApiResult<Json<Vec<Project>>> {
+/// Only the projects the caller can see, each with the caller's role there.
+/// A project nobody is a member of, and that isn't the caller's, simply
+/// doesn't appear — that's what keeps agents off work that isn't theirs.
+pub async fn list(State(state): State<AppState>, Auth(p): Auth) -> ApiResult<Json<Vec<ProjectItem>>> {
+    let mut conn = state.db.acquire().await?;
     let projects = sqlx::query_as::<_, Project>(
         "SELECT id, key, name, description, created_at FROM projects ORDER BY name",
     )
-    .fetch_all(&state.db)
+    .fetch_all(&mut *conn)
     .await?;
-    Ok(Json(projects))
+    let mut out = Vec::new();
+    for project in projects {
+        if let Some(role) = p.role_in(&mut conn, project.id).await? {
+            out.push(ProjectItem { project, role: role.as_str() });
+        }
+    }
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]
@@ -81,10 +101,15 @@ fn clean_name(name: &str, what: &str) -> ApiResult<String> {
     Ok(n.to_string())
 }
 
+/// Creating a project is deliberately site-admin-only: it keeps the roster
+/// of projects something the master/manager curates, not something any
+/// agent can spawn on a whim.
 pub async fn create(
     State(state): State<AppState>,
+    Auth(p): Auth,
     Json(body): Json<CreateProject>,
 ) -> ApiResult<(StatusCode, Json<ProjectDetail>)> {
+    p.require_site_admin()?;
     let key = clean_key(&body.key)?;
     let name = clean_name(&body.name, "Project name")?;
     let mut tx = write_tx(&state.db).await?;
@@ -105,16 +130,30 @@ pub async fn create(
             .execute(&mut *tx)
             .await?;
     }
-    let detail = load_detail(&mut tx, id).await?;
+    // Whoever creates a project administers it, so it isn't orphaned the
+    // moment the site admin's own token is narrowed to something else.
+    if let Some(user) = p.user_id {
+        sqlx::query("INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, 'admin')")
+            .bind(id)
+            .bind(user)
+            .execute(&mut *tx)
+            .await?;
+    }
+    let detail = load_detail(&mut tx, id, Role::Admin).await?;
     tx.commit().await?;
     state.events.emit("project.changed", Some(id), &[]);
     Ok((StatusCode::CREATED, Json(detail)))
 }
 
-pub async fn get(State(state): State<AppState>, Path(key): Path<String>) -> ApiResult<Json<ProjectDetail>> {
+pub async fn get(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path(key): Path<String>,
+) -> ApiResult<Json<ProjectDetail>> {
     let mut conn = state.db.acquire().await?;
     let id = project_id_by_key(&mut conn, &key).await?;
-    Ok(Json(load_detail(&mut conn, id).await?))
+    let role = p.require(&mut conn, id, Role::Viewer).await?;
+    Ok(Json(load_detail(&mut conn, id, role).await?))
 }
 
 #[derive(Deserialize)]
@@ -125,11 +164,14 @@ pub struct UpdateProject {
 
 pub async fn update(
     State(state): State<AppState>,
+    Auth(p): Auth,
     Path(key): Path<String>,
     Json(body): Json<UpdateProject>,
 ) -> ApiResult<Json<ProjectDetail>> {
+    p.require_writable()?;
     let mut tx = write_tx(&state.db).await?;
     let id = project_id_by_key(&mut tx, &key).await?;
+    p.require(&mut tx, id, Role::Admin).await?;
     if let Some(name) = body.name {
         sqlx::query("UPDATE projects SET name = ? WHERE id = ?")
             .bind(clean_name(&name, "Project name")?)
@@ -144,7 +186,7 @@ pub async fn update(
             .execute(&mut *tx)
             .await?;
     }
-    let detail = load_detail(&mut tx, id).await?;
+    let detail = load_detail(&mut tx, id, Role::Admin).await?;
     tx.commit().await?;
     state.events.emit("project.changed", Some(id), &[]);
     Ok(Json(detail))
@@ -152,10 +194,12 @@ pub async fn update(
 
 pub async fn list_statuses(
     State(state): State<AppState>,
+    Auth(p): Auth,
     Path(key): Path<String>,
 ) -> ApiResult<Json<Vec<Status>>> {
     let mut conn = state.db.acquire().await?;
     let id = project_id_by_key(&mut conn, &key).await?;
+    p.require(&mut conn, id, Role::Viewer).await?;
     Ok(Json(load_statuses(&mut conn, id).await?))
 }
 
@@ -167,13 +211,16 @@ pub struct CreateStatus {
 
 pub async fn create_status(
     State(state): State<AppState>,
+    Auth(p): Auth,
     Path(key): Path<String>,
     Json(body): Json<CreateStatus>,
 ) -> ApiResult<(StatusCode, Json<Vec<Status>>)> {
+    p.require_writable()?;
     let name = clean_name(&body.name, "Status name")?;
     check_one_of("category", &body.category, &CATEGORIES)?;
     let mut tx = write_tx(&state.db).await?;
     let project_id = project_id_by_key(&mut tx, &key).await?;
+    p.require(&mut tx, project_id, Role::Admin).await?;
     sqlx::query(
         "INSERT INTO statuses (project_id, name, category, position)
          VALUES (?, ?, ?, (SELECT COALESCE(MAX(position), -1) + 1 FROM statuses WHERE project_id = ?))",
@@ -190,12 +237,20 @@ pub async fn create_status(
     Ok((StatusCode::CREATED, Json(statuses)))
 }
 
-async fn status_row(conn: &mut SqliteConnection, id: i64) -> ApiResult<Status> {
-    sqlx::query_as::<_, Status>("SELECT id, project_id, name, category, position FROM statuses WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&mut *conn)
-        .await?
-        .ok_or_else(|| AppError::not_found("Status"))
+/// A status in a project the caller can at least view; otherwise, as far as
+/// the caller is concerned, it doesn't exist.
+async fn status_row(conn: &mut SqliteConnection, p: &Principal, id: i64) -> ApiResult<Status> {
+    let status = sqlx::query_as::<_, Status>(
+        "SELECT id, project_id, name, category, position FROM statuses WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(|| AppError::not_found("Status"))?;
+    if p.role_in(conn, status.project_id).await?.is_none() {
+        return Err(AppError::not_found("Status"));
+    }
+    Ok(status)
 }
 
 /// Keep `resolved_at` consistent after a status's category changes.
@@ -223,11 +278,14 @@ pub struct UpdateStatus {
 
 pub async fn update_status(
     State(state): State<AppState>,
+    Auth(p): Auth,
     Path(id): Path<i64>,
     Json(body): Json<UpdateStatus>,
 ) -> ApiResult<Json<Vec<Status>>> {
+    p.require_writable()?;
     let mut tx = write_tx(&state.db).await?;
-    let status = status_row(&mut tx, id).await?;
+    let status = status_row(&mut tx, &p, id).await?;
+    p.require(&mut tx, status.project_id, Role::Admin).await?;
     if let Some(name) = body.name {
         sqlx::query("UPDATE statuses SET name = ? WHERE id = ?")
             .bind(clean_name(&name, "Status name")?)
@@ -259,12 +317,15 @@ pub struct DeleteStatusQuery {
 
 pub async fn delete_status(
     State(state): State<AppState>,
-    Actor(actor): Actor,
+    Auth(p): Auth,
     Path(id): Path<i64>,
     Query(query): Query<DeleteStatusQuery>,
 ) -> ApiResult<Json<Vec<Status>>> {
+    p.require_writable()?;
+    let actor = p.user_id;
     let mut tx = write_tx(&state.db).await?;
-    let status = status_row(&mut tx, id).await?;
+    let status = status_row(&mut tx, &p, id).await?;
+    p.require(&mut tx, status.project_id, Role::Admin).await?;
     let siblings: i64 = sqlx::query_scalar("SELECT count(*) FROM statuses WHERE project_id = ?")
         .bind(status.project_id)
         .fetch_one(&mut *tx)
@@ -283,7 +344,7 @@ pub async fn delete_status(
                 format!("{} tickets use this status; choose a status to move them to", tickets.len()),
             ));
         };
-        let target = status_row(&mut tx, target_id).await?;
+        let target = status_row(&mut tx, &p, target_id).await?;
         if target.project_id != status.project_id || target.id == id {
             return Err(AppError::invalid("Tickets must move to another status in the same project"));
         }
@@ -352,11 +413,14 @@ pub struct Reorder {
 
 pub async fn reorder_statuses(
     State(state): State<AppState>,
+    Auth(p): Auth,
     Path(key): Path<String>,
     Json(body): Json<Reorder>,
 ) -> ApiResult<Json<Vec<Status>>> {
+    p.require_writable()?;
     let mut tx = write_tx(&state.db).await?;
     let project_id = project_id_by_key(&mut tx, &key).await?;
+    p.require(&mut tx, project_id, Role::Admin).await?;
     let current: HashSet<i64> = load_statuses(&mut tx, project_id).await?.iter().map(|s| s.id).collect();
     let given: HashSet<i64> = body.ids.iter().copied().collect();
     if given != current || given.len() != body.ids.len() {
@@ -373,4 +437,132 @@ pub async fn reorder_statuses(
     tx.commit().await?;
     state.events.emit("project.changed", Some(project_id), &[]);
     Ok(Json(statuses))
+}
+
+// ---------------------------------------------------------------- members
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct Member {
+    user_id: i64,
+    username: String,
+    display_name: String,
+    color: String,
+    kind: String,
+    role: String,
+}
+
+async fn members(conn: &mut SqliteConnection, project_id: i64) -> ApiResult<Vec<Member>> {
+    Ok(sqlx::query_as::<_, Member>(
+        "SELECT u.id AS user_id, u.username, u.display_name, u.color, u.kind, m.role
+           FROM project_members m JOIN users u ON u.id = m.user_id
+          WHERE m.project_id = ?
+          ORDER BY CASE m.role WHEN 'admin' THEN 0 WHEN 'member' THEN 1 ELSE 2 END, u.display_name",
+    )
+    .bind(project_id)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
+pub async fn list_members(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path(key): Path<String>,
+) -> ApiResult<Json<Vec<Member>>> {
+    let mut conn = state.db.acquire().await?;
+    let id = project_id_by_key(&mut conn, &key).await?;
+    p.require(&mut conn, id, Role::Viewer).await?;
+    Ok(Json(members(&mut conn, id).await?))
+}
+
+#[derive(Deserialize)]
+pub struct SetMember {
+    role: String,
+}
+
+/// Add someone to a project, or change their role. Project admins (or a
+/// site admin) only — this is exactly the knob that limits which projects
+/// an agent's own token can reach.
+pub async fn set_member(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path((key, user_id)): Path<(String, i64)>,
+    Json(body): Json<SetMember>,
+) -> ApiResult<Json<Vec<Member>>> {
+    p.require_writable()?;
+    let role =
+        Role::parse(&body.role).ok_or_else(|| AppError::invalid("role must be viewer, member or admin"))?;
+    let mut tx = write_tx(&state.db).await?;
+    let id = project_id_by_key(&mut tx, &key).await?;
+    p.require(&mut tx, id, Role::Admin).await?;
+    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    exists.ok_or_else(|| AppError::not_found("User"))?;
+    if role != Role::Admin {
+        last_admin_check(&mut tx, id, user_id).await?;
+    }
+    sqlx::query(
+        "INSERT INTO project_members (project_id, user_id, role) VALUES (?, ?, ?)
+         ON CONFLICT (project_id, user_id) DO UPDATE SET role = excluded.role",
+    )
+    .bind(id)
+    .bind(user_id)
+    .bind(role.as_str())
+    .execute(&mut *tx)
+    .await?;
+    let list = members(&mut tx, id).await?;
+    tx.commit().await?;
+    state.events.emit("project.changed", Some(id), &[]);
+    Ok(Json(list))
+}
+
+pub async fn remove_member(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path((key, user_id)): Path<(String, i64)>,
+) -> ApiResult<Json<Vec<Member>>> {
+    p.require_writable()?;
+    let mut tx = write_tx(&state.db).await?;
+    let id = project_id_by_key(&mut tx, &key).await?;
+    p.require(&mut tx, id, Role::Admin).await?;
+    last_admin_check(&mut tx, id, user_id).await?;
+    sqlx::query("DELETE FROM project_members WHERE project_id = ? AND user_id = ?")
+        .bind(id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    let list = members(&mut tx, id).await?;
+    tx.commit().await?;
+    state.events.emit("project.changed", Some(id), &[]);
+    Ok(Json(list))
+}
+
+/// A project must keep at least one member admin, or only a site admin
+/// could manage it again.
+async fn last_admin_check(conn: &mut SqliteConnection, project_id: i64, leaving: i64) -> ApiResult<()> {
+    let is_admin: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM project_members WHERE project_id = ? AND user_id = ? AND role = 'admin'",
+    )
+    .bind(project_id)
+    .bind(leaving)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if is_admin.is_none() {
+        return Ok(());
+    }
+    let others: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM project_members WHERE project_id = ? AND role = 'admin' AND user_id <> ?",
+    )
+    .bind(project_id)
+    .bind(leaving)
+    .fetch_one(&mut *conn)
+    .await?;
+    if others == 0 {
+        return Err(AppError::conflict(
+            "last_project_admin",
+            "A project needs at least one admin; add another first",
+        ));
+    }
+    Ok(())
 }

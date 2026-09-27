@@ -8,7 +8,9 @@ the web UI embedded in it, backed by a single SQLite file.
 - **Backend:** Rust (axum, tokio, sqlx) + SQLite (WAL, FTS5 full-text search)
 - **Frontend:** Svelte 5 + TypeScript + Vite; Svelte Flow + ELK for the DAG view
 - **Live updates:** Server-Sent Events, so every open tab updates immediately
-- **AI agents:** a built-in MCP server (HTTP at `/mcp`, or stdio via `kanban-server mcp`)
+- **AI agents:** a built-in MCP server (HTTP at `/mcp`, or stdio via `kanban-server mcp`), authenticated by API token
+- **Accounts and roles:** humans sign in with a password; agents use scoped API tokens; a site admin sees every
+  project by default, everyone else only the projects they're added to
 - **Themes:** dark (default, white text) and light, switchable with `T`
 
 Part of the `ai-system` project, where it will replace the minimal ticket
@@ -42,15 +44,48 @@ the named volume `kanban-data` and survives `docker compose down` and image
 rebuilds; only `docker compose down -v` deletes it. Seed demo data in Docker
 with `KANBAN_DEMO=1 docker compose up -d --build`.
 
-**There is no authentication.** The server binds to 127.0.0.1 by default,
-and the Docker setup publishes it on the host's 127.0.0.1 only. You choose
-who you are "acting as" in the top-right corner; that is attribution, not
-security. Don't expose it to a network without putting auth in front.
+### Accounts, roles and tokens
 
-Because "localhost only" doesn't stop web pages in your own browser, every
-request's `Host` and `Origin` headers must name an allowed host (loopback by
-default). Other requests get `403`. This blocks DNS-rebinding and cross-site
-attacks from malicious websites (`server/src/guard.rs`).
+The first time the server starts with no administrator yet, it prints a
+**one-time setup code** to its log (`no administrator yet — open the board
+and enter this one-time setup code: XXXX-XXXX`). Open the board, enter the
+code, and pick a username and password — that account is a **site admin**:
+it sees and manages every project, the same as a master switch.
+
+From there, everything is **project membership**:
+
+- **Site admins** ("master") always see and manage every project, current and
+  future, without being added anywhere. Use this for yourself and, if you
+  want, one manager/orchestrator agent — Settings → People → "Make master".
+- **Everyone else** — every ordinary agent, and any human you don't make an
+  admin — only sees a project once someone adds them to it, with a role:
+  **viewer** (read), **member** (create/edit tickets, comment, link),
+  **admin** (workflow, membership, deleting tickets). A project that isn't
+  yours doesn't 403 — it 404s, as if it doesn't exist. This is the whole
+  point: it's what stops an agent from picking up work that isn't its by
+  accident, without you having to remember to hide anything.
+- **Agents authenticate with API tokens**, not passwords (`Authorization:
+  Bearer kbn_...`). Create one from **Settings → Tokens**: name it, optionally
+  narrow it to specific projects (default: every project that account can
+  reach) and mark it read-only, set an expiry (default 90 days), and the
+  board shows you the secret **once**. A token can never reach further than
+  the account it belongs to — narrowing only ever restricts, never grants.
+  The same tokens authenticate MCP.
+- Humans sign in with a session cookie (`HttpOnly`, `SameSite=Strict`, 30
+  days); agents never get a cookie. Revoking a token or deactivating an
+  account takes effect immediately, everywhere, including open MCP
+  connections and SSE streams.
+
+**Still, this is a local, single-machine tool, not a hosted product:** there's
+no email verification, password reset flow, or audit log UI, and the server
+binds to 127.0.0.1 by default. Even so, because "localhost only" doesn't stop
+a malicious web page open in your own browser, every request's `Host` and
+`Origin` headers must also name an allowed host (loopback by default) —
+`server/src/guard.rs` blocks DNS-rebinding and cross-site attacks before auth
+even runs. Login and setup attempts are rate-limited per account. Security
+response headers (CSP, `X-Frame-Options`, etc.) are set on every response
+(`server/src/headers.rs`). None of this is a substitute for not exposing the
+board to a real network without a reverse proxy and TLS in front of it.
 
 ### Configuration (environment variables)
 
@@ -61,6 +96,7 @@ attacks from malicious websites (`server/src/guard.rs`).
 | `KANBAN_BIND` | `127.0.0.1` | Listen address; logs a warning if not loopback |
 | `KANBAN_ALLOWED_HOSTS` | *(empty)* | Extra host names the board may be reached by, comma-separated (loopback names are always allowed). Needed only if you serve it on a LAN name or IP |
 | `KANBAN_DEMO` | `0` | `1` = same as `--demo` |
+| `KANBAN_COOKIE_SECURE` | `0` | `1` adds `Secure` to the session cookie. Only set this if the board is actually served over HTTPS (e.g. behind a reverse proxy) — over plain HTTP it makes the browser silently refuse to ever send the cookie |
 | `RUST_LOG` | `kanban_server=info,tower_http=warn` | Log filter |
 
 ### Connect AI agents (MCP)
@@ -71,35 +107,39 @@ server, so any MCP client can read and work the board through typed tools:
 `list_ready_tickets` (what's unblocked and not done), `get_ticket`,
 `create_ticket`, `update_ticket`, `add_comment`, `link_tickets` and
 `unlink_tickets`. Tools take keys, status names, usernames and label names.
-They go through the same API as the UI, so cycle and height checks, history
-and live updates all apply. Deleting is deliberately not exposed to agents.
+They go through the same API as the UI, so cycle and height checks, history,
+permissions and live updates all apply exactly as they do for a person —
+**a narrowed token only ever sees the projects it's a member of, over MCP
+just as over the REST API.** Deleting is deliberately not exposed to agents.
 
-The board must be running. Changes are attributed to the username you give
-(created automatically on first use):
+First create an agent account and an API token for it from **Settings →
+People** and **Settings → Tokens** (see above). The board must be running.
 
 | Client | Setup |
 |---|---|
-| Claude Code | `claude mcp add --transport http kanban http://127.0.0.1:8610/mcp --header "X-Kanban-User: claude"` |
-| Any client with HTTP support | URL `http://127.0.0.1:8610/mcp`, header `X-Kanban-User: <username>` |
-| Any client with stdio only (Claude Desktop, Cursor, ...) | command `<path>/kanban/server/target/release/kanban-server`, args `["mcp", "--as", "<username>"]` |
-| Board in Docker, stdio client | command `docker`, args `["exec", "-i", "kanban-board", "kanban-server", "mcp", "--as", "<username>"]` |
+| Claude Code | `claude mcp add --transport http kanban http://127.0.0.1:8610/mcp --header "Authorization: Bearer kbn_..."` |
+| Any client with HTTP support | URL `http://127.0.0.1:8610/mcp`, header `Authorization: Bearer kbn_...` |
+| Any client with stdio only (Claude Desktop, Cursor, ...) | command `<path>/kanban/server/target/release/kanban-server`, args `["mcp", "--token", "kbn_..."]` |
+| Board in Docker, stdio client | command `docker`, args `["exec", "-i", "kanban-board", "kanban-server", "mcp", "--token", "kbn_..."]` |
 
-A typical JSON config for stdio clients:
+A typical JSON config for stdio clients (the Tokens page in the UI writes
+this out for you, with the real token filled in, right after you create one):
 
 ```json
 {
   "mcpServers": {
     "kanban": {
       "command": "C:/path/to/kanban/server/target/release/kanban-server.exe",
-      "args": ["mcp", "--as", "claude"]
+      "args": ["mcp", "--token", "kbn_..."]
     }
   }
 }
 ```
 
 `kanban-server mcp` forwards to `http://127.0.0.1:$KANBAN_PORT` (override with
-`--url` or `KANBAN_MCP_URL`) and returns a clear error if the board isn't
-running.
+`--url` or `KANBAN_MCP_URL`; the token can also come from `KANBAN_MCP_TOKEN`
+instead of `--token`) and returns a clear error, not a hang, if the board
+isn't running or the token is invalid, expired or revoked.
 
 ### Keyboard shortcuts
 
@@ -153,10 +193,33 @@ Breaking one of these breaks the product. Keep them.
 10. **Markdown is rendered only through `renderMarkdown()`** (`web/src/lib/markdown.ts`),
     which sanitizes with DOMPurify. Comments and descriptions are written by
     agents too, so treat them as untrusted. Never `{@html}` anything else.
-11. **No authentication by design**; keep the default bind on loopback.
-    `X-Actor: <user id>` only attributes changes. The `guard.rs` middleware
-    (Host/Origin allow-list) is the only thing standing between a malicious
-    web page and the API. Never remove it or add permissive CORS.
+11. **Every route needs a `Principal`, gotten one of three ways**, and no
+    fourth way may exist: (a) `Auth(p): Auth` extracts one the auth
+    middleware already put in the request's extensions after checking a
+    bearer token or session cookie; (b) code running **inside** the server
+    (demo seeding, MCP tools) builds its own `Principal` and calls
+    `inproc::call`, which attaches it directly — this is the only legitimate
+    bypass of header-based auth, and it must never be reachable from
+    anything that echoes untrusted input into that `Principal`; (c) tests use
+    the same in-process attachment to skip auth *plumbing* while testing
+    *business logic* (`tests/api.rs`) — auth itself is tested for real, over
+    HTTP headers, in `tests/auth.rs`. Never accept an identity from a header
+    the caller controls (the old `X-Actor` is gone for exactly this reason).
+12. **The dependency graph is checked board-wide, always** (`blocks_edges()`
+    in `settings.rs`) — never scope the cycle/height *check* to what one
+    caller can see, or a hidden edge could let a real cycle through. Only the
+    *display* of a chain (an error message, `GET /settings`) is scoped to
+    visibility, via `blocks_edges_visible()` or by dropping the `chain` detail
+    entirely when it touches a project the caller can't see
+    (`Principal::sees_all`). Keep those two concerns separate.
+13. **No authentication by design allows binding past loopback.** Keep the
+    default bind on 127.0.0.1. The `guard.rs` middleware (Host/Origin
+    allow-list) runs *before* authentication and is the only thing standing
+    between a malicious web page and the API; never remove it or add
+    permissive CORS. `headers.rs` (CSP, frame-options, ...) runs on every
+    response; if you add a legitimate need for `'unsafe-inline'` or a new
+    origin, extend the CSP deliberately, in one place, with a comment saying
+    why — don't work around it in a component.
 
 ### Repository map
 
@@ -167,50 +230,61 @@ kanban/
   Dockerfile, compose.yaml          image = frontend build -> Rust build (embeds it) -> slim runtime; /data volume
   server/                           Rust crate `kanban-server`
     Cargo.toml, build.rs            build.rs makes Cargo rebuild when web/dist changes (the UI is embedded)
-    migrations/0001_init.sql        the whole schema (see Data model)
-    src/main.rs                     env config, `--demo`, `healthcheck` subcommand, starts axum
-    src/lib.rs                      AppState, open_db (WAL, foreign keys, migrations), router(), write_tx(), now_ms()
+    migrations/0001_init.sql        the ticket/board schema
+    migrations/0002_auth.sql        users.kind/is_admin/password_hash, project_members, api_tokens(_projects), sessions
+    src/main.rs                     env config, `--demo`, `healthcheck` and `mcp` subcommands, prints the setup code, starts axum
+    src/lib.rs                      AppState (db, events, setup_code, login_limiter, cookie_secure), open_db, router(), write_tx(), now_ms()
     src/error.rs                    AppError -> JSON {error:{code,message,detail}}; maps sqlx constraint errors to 400/409
-    src/guard.rs                    Host/Origin allow-list middleware (DNS rebinding + cross-site protection)
+    src/auth.rs                     Principal, Role, session/token authentication, password hashing, secrets — see Accounts, roles and tokens
+    src/guard.rs                    Host/Origin allow-list middleware (DNS rebinding + cross-site protection); runs before auth
+    src/headers.rs                  security response headers (CSP, X-Frame-Options, ...) on every response
+    src/ratelimit.rs                in-memory attempt limiter for login/setup, keyed by username
     src/events.rs                   broadcast channel feeding SSE
     src/dag.rs                      pure graph algorithms + unit tests (cycle path, longest chain, chain through a new edge)
     src/models.rs                   row structs, SUMMARY_SELECT (the one ticket-summary query), shared helpers
                                     (resolve_key, summaries, log_activity, reindex, watch, valid_parent, validation)
-    src/api/mod.rs                  route table, `Actor` extractor (X-Actor header), /api/health, /api/events (SSE)
-    src/api/tickets.rs              list/search/filter, detail, create, update (PATCH), move (drag and drop), watchers, activity
+    src/api/mod.rs                  route table, `Auth` re-export, /api/health, /api/events (SSE, visibility-filtered)
+    src/api/auth.rs                 /api/auth/{status,setup,login,logout,password}
+    src/api/tokens.rs               /api/tokens: create (scoped/read-only/expiry), list, revoke
+    src/api/tickets.rs              list/search/filter (visibility-scoped), detail, create, update (PATCH), move, watchers, activity
     src/api/deletion.rs             delete plan (preview) and deletion with explicit decisions for children and dependents
-    src/api/comments.rs             comment CRUD
-    src/api/links.rs                link create/delete with DAG checks; /api/graph for the DAG view
-    src/api/settings.rs             max_dag_height get/set; blocks_edges() and max_height() helpers
-    src/api/projects.rs             projects and their workflow statuses (create, rename, recategorize, reorder, delete-with-move)
-    src/api/labels.rs, users.rs     labels (global) and people
+    src/api/comments.rs             comment CRUD (edit/delete: author or a project/site admin only)
+    src/api/links.rs                link create/delete with DAG checks; /api/graph for the DAG view (both visibility-scoped)
+    src/api/settings.rs             max_dag_height get (any signed-in caller, scoped) / set (site admin); blocks_edges() / blocks_edges_visible()
+    src/api/projects.rs             projects, workflow statuses, and /members (role management)
+    src/api/labels.rs, users.rs     labels (global) and accounts (site-admin-managed; self-service for your own name/color)
     src/web.rs                      serves the embedded frontend (SPA fallback to index.html; /api/* never falls back)
-    src/inproc.rs                   calls the API in-process (used by demo seeding and MCP tools)
-    src/mcp/mod.rs                  MCP JSON-RPC: initialize, ping, tools/list, tools/call; POST /mcp handler
-    src/mcp/tools.rs                the MCP tools: schemas + implementations on top of the HTTP API
-    src/mcp/bridge.rs               `kanban-server mcp`: stdio <-> POST /mcp bridge (std-only HTTP/1.1 client)
-    src/demo.rs                     first-run user + `--demo` data, created by calling the real API in-process
-    tests/api.rs                    integration tests against a real temp SQLite file
-    tests/mcp.rs                    MCP protocol, an agent workflow end to end, and the stdio bridge over TCP
+    src/inproc.rs                   calls the API in-process with an explicit Principal (demo seeding, MCP tools)
+    src/mcp/mod.rs                  MCP JSON-RPC: initialize, ping, tools/list, tools/call; POST /mcp handler (bearer-token authenticated)
+    src/mcp/tools.rs                the MCP tools: schemas + implementations on top of the HTTP API, scoped by the caller's Principal
+    src/mcp/bridge.rs               `kanban-server mcp`: stdio <-> POST /mcp bridge (std-only HTTP/1.1 client, sends the bearer token)
+    src/demo.rs                     first-run user + `--demo` data, created by calling the real API in-process as the system principal
+    tests/api.rs                    ticket/DAG/deletion business-logic tests (auth is attached directly, not over headers)
+    tests/auth.rs                   the real auth surface over HTTP: setup/login/logout, roles, token scoping, visibility, rate limits
+    tests/mcp.rs                    MCP protocol, an agent workflow end to end, token-scoped visibility, and the stdio bridge over TCP
   web/                              Svelte 5 app (runes only; no legacy `export let` or stores)
-    src/main.ts, App.svelte         mount; routing, keyboard shortcuts, same-origin link interception
+    src/main.ts, App.svelte         mount; auth gate (setup/login/app), routing, keyboard shortcuts, same-origin link interception
     src/app.css                     design tokens (CSS variables) for dark/light + shared .btn/.input/.chip/.md styles
-    src/lib/api.ts                  typed fetch client; the ONLY place that calls the server; throws ApiError
-    src/lib/types.ts                TypeScript mirrors of server JSON + enums (TYPES, PRIORITIES, LINK_CHOICES)
-    src/lib/store.svelte.ts         global state: users, labels, projects, current project, actor, theme, SSE -> version counters
+    src/lib/api.ts                  typed fetch client; the ONLY place that calls the server; throws ApiError; onUnauthorized() hook
+    src/lib/types.ts                TypeScript mirrors of server JSON + enums (TYPES, PRIORITIES, LINK_CHOICES, Role)
+    src/lib/store.svelte.ts         global state: me (signed-in identity), users, labels, projects (with role), current project, theme, SSE
     src/lib/router.svelte.ts        history-API router; `?ticket=KEY` opens the side panel on any page
     src/lib/filters.svelte.ts       board/list filters (instant client filtering + server full-text hits)
     src/lib/toast.svelte.ts         toasts and the promise-based confirm dialog
     src/lib/markdown.ts             marked + DOMPurify; ticket keys become links
-    src/components/                 BoardView (drag and drop), ListView, GraphView (lazy-loaded; ELK is ~1.4MB),
-                                    TicketPanel (+ panel/*), CreateTicket, SettingsView, pickers, Sidebar, Topbar
+    src/components/                 SetupView, LoginView, AccountMenu, BoardView (drag and drop), ListView,
+                                    GraphView (lazy-loaded; ELK is ~1.4MB), TicketPanel (+ panel/*), CreateTicket,
+                                    SettingsView (+ settings/PeoplePanel, settings/TokensPanel), ProjectMembers, Sidebar, Topbar
 ```
 
 ### Data model (SQLite)
 
 | Table | Purpose / notes |
 |---|---|
-| `users` | People and agents. Never deleted, only `active = 0`. `username` unique, case-insensitive. |
+| `users` | People and agents. `kind` (human/agent), `is_admin` (site admin = sees every project), `password_hash` (humans only, Argon2id; null for agents). Never deleted, only `active = 0`. `username` unique, case-insensitive. |
+| `project_members` | `(project_id, user_id) -> role` (viewer/member/admin). Visibility for non-admins; a project you're not in doesn't exist to you. |
+| `api_tokens`, `api_token_projects` | A token belongs to one user; only its SHA-256 hash is stored. `all_projects` or a narrowed set via the join table; `read_only`; `expires_at`; `revoked_at`. |
+| `sessions` | Browser login sessions; `hash` (SHA-256 of the cookie value) is the key, so the plaintext session id is never stored either. |
 | `projects` | `key` (2-10 chars, `^[A-Z][A-Z0-9]+$`), `next_number` for ticket numbering. |
 | `statuses` | Per-project workflow columns: `name`, `category` (`todo`/`in_progress`/`done`), `position`. The category decides `resolved_at`. |
 | `labels` | Global, unique name (case-insensitive). |
@@ -238,18 +312,28 @@ updates one row. When the gap falls below 1e-6, that column is renumbered
 
 ### API reference (all JSON, prefix `/api`)
 
-Send `X-Actor: <user id>` on writes to attribute them. Errors look like
+Every route needs `Authorization: Bearer kbn_...` or a session cookie, except
+`/health`, `/auth/status`, `/auth/setup` and `/auth/login`. Errors look like
 `{"error": {"code": "...", "message": "...", "detail": ...}}`. Codes:
-`invalid` (400), `not_found` (404), `duplicate`, `cycle`, `height_exceeded`,
-`status_in_use`, `last_status`, `decision_required` (409), `internal` (500). For `cycle` and
-`height_exceeded`, `detail.chain` lists the ticket keys involved.
+`invalid` (400), `unauthenticated` (401), `forbidden`, `cross_project_dependency` (403),
+`not_found` (404), `duplicate`, `cycle`, `height_exceeded`, `status_in_use`,
+`last_status`, `last_admin`, `last_project_admin`, `decision_required`,
+`already_set_up` (409), `rate_limited` (429), `internal` (500). For `cycle`
+and `height_exceeded`, `detail.chain` lists the ticket keys involved — omitted
+entirely if the chain passes through a project you can't see.
 
 | Method & path | Purpose |
 |---|---|
-| `GET /health` | `{ok, tickets}` |
-| `GET /events` | SSE stream (see below) |
-| `GET/POST /users`, `PATCH /users/{id}` | People (`username`, `display_name`, `color`, `active`) |
-| `GET/POST /projects`, `GET/PATCH /projects/{key}` | Projects; detail includes `statuses` |
+| `GET /health` | `{ok}`. Public, and deliberately says nothing about the board's contents |
+| `GET /events` | SSE stream, filtered to projects the caller can see (see below) |
+| `GET /auth/status` | `{setup_required, user: Me\|null, via: "token"\|"session"\|null}`. Public |
+| `POST /auth/setup` | `{code, username, display_name?, password}`. Works once, before any admin exists |
+| `POST /auth/login`, `POST /auth/logout` | `{username, password}` -> sets/clears the session cookie |
+| `POST /auth/password` | `{current, new}`. Session only, not a token |
+| `GET /tokens?user_id=`, `POST /tokens`, `DELETE /tokens/{id}` | API tokens. `POST` body: `{name, user_id?, projects?: [KEY], read_only?, expires_in_days?}`; response includes the plaintext `token` **once**. Managing another account's tokens needs site admin |
+| `GET/POST /users`, `PATCH /users/{id}` | Accounts (`username`, `display_name`, `color`, `kind`, `is_admin`, `active`, `password`). Site-admin only, except your own `display_name`/`color` |
+| `GET/POST /projects`, `GET/PATCH /projects/{key}` | Only projects you can see; each item/detail includes your `role`. `POST` (create) is site-admin only |
+| `GET /projects/{key}/members`, `PUT/DELETE /projects/{key}/members/{user_id}` | Project roles (viewer/member/admin); project-admin only to change |
 | `GET/POST /projects/{key}/statuses` | List / add a status (`name`, `category`) |
 | `PUT /projects/{key}/statuses/order` | `{ids: [...]}`, every status exactly once |
 | `PATCH /statuses/{id}`, `DELETE /statuses/{id}?move_to={id}` | Rename / recategorize; delete (tickets must move somewhere) |
@@ -266,7 +350,8 @@ Send `X-Actor: <user id>` on writes to attribute them. Errors look like
 | `GET/POST /tickets/{key}/comments`, `PATCH/DELETE /comments/{id}` | Comments |
 | `POST /links`, `DELETE /links?source=&target=&kind=` | `{source, target, kind}`; for `blocks`, source must finish first |
 | `GET /graph?project=KEY&all=bool` | DAG view: `nodes`, `edges`, `hierarchy`, `longest_chain` (ids), `max_height` |
-| `GET/PATCH /settings` | `{max_dag_height: int or null}`; response adds `dag_height`, `longest_chain` |
+| `GET /settings` | Any signed-in caller; `dag_height`/`longest_chain` are scoped to what you can see (the true board-wide figures for a site admin) |
+| `PATCH /settings` | `{max_dag_height: int or null}`. Site-admin only — it's a board-wide policy |
 
 **Ticket summary fields** (list, board, graph): `id, key, project_id, number,
 type, title, status_id, status_name, status_category, priority, assignee_id,
@@ -310,9 +395,15 @@ means the client missed events and should refetch everything.
 6. Add a case to `tests/api.rs`, then run the checks below.
 
 **Add an endpoint:** write the handler in the matching `api/*.rs` (extractors:
-`State`, `Actor`, `Path`, `Query`, `Json`; return `ApiResult<...>`), register it
-in `api/mod.rs::routes()` (axum 0.8 path syntax: `/{param}`), use `write_tx`
-for writes, emit an event after commit, and add a method to `web/src/lib/api.ts`.
+`State`, `Auth`, `Path`, `Query`, `Json`; return `ApiResult<...>`). Decide and
+enforce its access explicitly: `p.require_writable()?` for any mutation (read-
+only tokens must be blocked), then `p.require(&mut tx, project_id, Role::_)?`
+or `p.require_ticket(&mut tx, id, Role::_)?` for anything project- or ticket-
+scoped, or `p.require_site_admin()?` for board-wide actions. Register the
+route in `api/mod.rs::routes()` (axum 0.8 path syntax: `/{param}`), use
+`write_tx` for writes, emit an event after commit, and add a method to
+`web/src/lib/api.ts`. Add a case to `tests/auth.rs` proving the access you
+just decided on is actually enforced, not just the happy path.
 
 **Add a link kind:** extend the `CHECK` constraint via a migration (SQLite needs
 a table rebuild for that), `LINK_KINDS` in `models.rs`, `link_label()` in
@@ -333,7 +424,7 @@ Global settings go in the `settings` table through `api/settings.rs`.
 ### Checks to run after a change
 
 ```bash
-cd server && cargo fmt && cargo clippy --all-targets && cargo test   # unit + API + MCP tests
+cd server && cargo fmt && cargo clippy --all-targets && cargo test   # unit + api + auth + mcp tests
 cd web && npx svelte-check --tsconfig ./tsconfig.app.json && npm run build
 ```
 
@@ -366,6 +457,15 @@ suites don't cover the UI. Development with hot reload uses two terminals:
   is set up. Anything else printed to stdout would corrupt the protocol.
 - **Graceful shutdown is intentionally off:** open SSE streams would make
   Ctrl+C hang. SQLite in WAL mode is safe to stop at any time.
+- **CSP `style-src` needs `'unsafe-inline'`.** Chromium gates inline style
+  *attributes* on `style-src` regardless of whether they're set from HTML or
+  from JS (`element.style.x = ...`, which is how Svelte's `style:` directive
+  works) — it's not only about `<style>` tags. `script-src` has no such
+  exception and stays `'self'` only; move any inline `<script>` (there was
+  one, the early theme-flash fix) to an external file instead of relaxing it.
+- **Visibility vs. the DAG check are different concerns, on purpose** (see
+  hard rule #12). If you're touching `links.rs`, `deletion.rs` or
+  `settings.rs`, know which one you're changing before you change it.
 
 ### Not built yet (Phase 2)
 
@@ -373,5 +473,6 @@ Sprints and backlog planning, work-in-progress limits per column, attachments,
 due dates and time tracking, components and versions, a JQL-like query
 language, bulk edit, saved filters, @mentions and notifications, webhooks,
 custom fields, workflow transition rules, swimlanes, reports (burndown,
-cumulative flow), authentication, and integration with `ai-system`'s
-orchestrator (replacing `../board`).
+cumulative flow), password reset / email verification, an audit log UI for
+token and permission changes, and integration with `ai-system`'s orchestrator
+(replacing `../board`).

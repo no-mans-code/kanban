@@ -31,6 +31,9 @@ export function childTypeFor(parent: TicketType): TicketType | null {
   return 'subtask'
 }
 
+export type UserKind = 'human' | 'agent'
+export type Role = 'viewer' | 'member' | 'admin'
+
 export interface User {
   id: number
   username: string
@@ -38,6 +41,43 @@ export interface User {
   color: string
   active: boolean
   created_at: number
+  kind: UserKind
+  is_admin: boolean
+  has_password: boolean
+}
+
+/** The signed-in caller, as returned by /api/auth/status. */
+export interface Me {
+  id: number
+  username: string
+  display_name: string
+  color: string
+  kind: UserKind
+  is_admin: boolean
+}
+
+export interface ProjectMember {
+  user_id: number
+  username: string
+  display_name: string
+  color: string
+  kind: UserKind
+  role: Role
+}
+
+export interface ApiToken {
+  id: number
+  user_id: number
+  username: string
+  name: string
+  hint: string
+  read_only: boolean
+  all_projects: boolean
+  projects: string[] | null
+  created_at: number
+  expires_at: number | null
+  last_used_at: number | null
+  revoked_at: number | null
 }
 
 export interface Project {
@@ -46,6 +86,11 @@ export interface Project {
   name: string
   description: string
   created_at: number
+}
+
+/** A project as listed for the signed-in caller: only ones they can see, each with their role in it. */
+export interface ProjectItem extends Project {
+  role: Role
 }
 
 export interface Status {
@@ -58,6 +103,7 @@ export interface Status {
 
 export interface ProjectDetail extends Project {
   statuses: Status[]
+  role: Role
 }
 
 export interface Label {
@@ -138,6 +184,7 @@ export interface Settings {
   max_dag_height: number | null
   dag_height: number
   longest_chain: string[]
+  is_site_admin: boolean
 }
 
 export type ChildrenChoice = 'delete' | 'detach' | 'move' | 'promote'

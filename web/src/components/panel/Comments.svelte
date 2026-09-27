@@ -55,7 +55,7 @@
 </script>
 
 <div class="composer">
-  <Avatar userId={app.actorId} size={28} />
+  <Avatar userId={app.me?.id ?? null} size={28} />
   <div class="box">
     <textarea
       class="textarea"

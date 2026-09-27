@@ -1,5 +1,7 @@
 //! First-run bootstrap and optional demo data. Both go through the real HTTP
-//! API in-process, so seeded data passes the same validation as anything else.
+//! API in-process, so seeded data passes the same validation as anything
+//! else. Runs as the system principal (full access), the same as any other
+//! in-process caller that has already made its own access decision.
 
 use std::collections::HashMap;
 
@@ -8,7 +10,12 @@ use axum::Router;
 use axum::http::Method;
 use serde_json::{Value, json};
 
+use crate::auth::Principal;
 use crate::inproc::call;
+
+async fn get(app: &Router, uri: &str) -> anyhow::Result<Value> {
+    Ok(call(app, Method::GET, uri, Principal::system(), None).await?.1)
+}
 
 async fn ok(
     app: &Router,
@@ -17,7 +24,11 @@ async fn ok(
     actor: Option<i64>,
     body: Value,
 ) -> anyhow::Result<Value> {
-    let (status, value) = call(app, method.clone(), uri, actor, Some(body)).await?;
+    let principal = match actor {
+        Some(id) => Principal::acting_as(id),
+        None => Principal::system(),
+    };
+    let (status, value) = call(app, method.clone(), uri, principal, Some(body)).await?;
     if !(200..300).contains(&status) {
         bail!("{method} {uri} failed with {status}: {value}");
     }
@@ -26,7 +37,7 @@ async fn ok(
 
 /// Make sure there is at least one user to act as.
 pub async fn bootstrap(app: &Router) -> anyhow::Result<()> {
-    let (_, users) = call(app, Method::GET, "/api/users", None, None).await?;
+    let users = get(app, "/api/users").await?;
     if users.as_array().is_some_and(|u| u.is_empty()) {
         ok(app, Method::POST, "/api/users", None, json!({ "username": "me", "display_name": "Me" })).await?;
     }
@@ -34,7 +45,7 @@ pub async fn bootstrap(app: &Router) -> anyhow::Result<()> {
 }
 
 async fn user_ids(app: &Router, wanted: &[(&str, &str)]) -> anyhow::Result<HashMap<String, i64>> {
-    let (_, users) = call(app, Method::GET, "/api/users", None, None).await?;
+    let users = get(app, "/api/users").await?;
     let mut ids: HashMap<String, i64> = users
         .as_array()
         .context("user list")?
@@ -48,7 +59,7 @@ async fn user_ids(app: &Router, wanted: &[(&str, &str)]) -> anyhow::Result<HashM
                 Method::POST,
                 "/api/users",
                 None,
-                json!({ "username": username, "display_name": display }),
+                json!({ "username": username, "display_name": display, "kind": "agent" }),
             )
             .await?;
             ids.insert(username.to_string(), u["id"].as_i64().context("user id")?);
@@ -58,9 +69,10 @@ async fn user_ids(app: &Router, wanted: &[(&str, &str)]) -> anyhow::Result<HashM
 }
 
 /// A small project that exercises every feature: hierarchy, a dependency
-/// chain that crosses epics, comments, labels and each status.
+/// chain that crosses epics, comments, labels, each status, and a spread of
+/// project roles so the access-control model has something real to show.
 pub async fn seed(app: &Router) -> anyhow::Result<()> {
-    let (status, _) = call(app, Method::GET, "/api/projects/DEMO", None, None).await?;
+    let (status, _) = call(app, Method::GET, "/api/projects/DEMO", Principal::system(), None).await?;
     if status == 200 {
         return Ok(());
     }
@@ -81,10 +93,7 @@ pub async fn seed(app: &Router) -> anyhow::Result<()> {
         Method::POST,
         "/api/projects",
         None,
-        json!({
-            "key": "DEMO", "name": "Demo: Agent Platform",
-            "description": "Sample data for exploring the board."
-        }),
+        json!({ "key": "DEMO", "name": "Demo: Agent Platform", "description": "Sample data for exploring the board." }),
     )
     .await?;
     let status: HashMap<String, i64> = project["statuses"]
@@ -94,7 +103,15 @@ pub async fn seed(app: &Router) -> anyhow::Result<()> {
         .filter_map(|s| Some((s["name"].as_str()?.to_string(), s["id"].as_i64()?)))
         .collect();
 
-    let (_, existing) = call(app, Method::GET, "/api/labels", None, None).await?;
+    // A spread of roles: ada administers the project, grace and coder work
+    // tickets in it, research can only look. This is what a narrowed API
+    // token for one of these accounts would actually be limited to.
+    for (user, role) in [(ada, "admin"), (grace, "member"), (coder, "member"), (research, "viewer")] {
+        ok(app, Method::PUT, &format!("/api/projects/DEMO/members/{user}"), None, json!({ "role": role }))
+            .await?;
+    }
+
+    let existing = get(app, "/api/labels").await?;
     let mut labels: HashMap<String, i64> = existing
         .as_array()
         .context("labels")?

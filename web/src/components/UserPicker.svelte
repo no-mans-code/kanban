@@ -19,6 +19,7 @@
 
   let open = $state(false)
   let q = $state('')
+  const myId = $derived(app.me?.id ?? null)
   const selected = $derived(value === null ? null : app.usersById.get(value))
   const options = $derived(
     app.activeUsers.filter(
@@ -51,9 +52,9 @@
         if (e.key === 'Enter' && options[0]) pick(options[0].id, close)
       }}
     />
-    {#if app.actorId !== null && app.actorId !== value && !exclude.includes(app.actorId)}
-      <button class="opt" onclick={() => pick(app.actorId, close)}>
-        <Avatar userId={app.actorId} size={20} /> Assign to me
+    {#if myId !== null && myId !== value && !exclude.includes(myId)}
+      <button class="opt" onclick={() => pick(myId, close)}>
+        <Avatar userId={myId} size={20} /> Assign to me
       </button>
     {/if}
     {#if allowNone}

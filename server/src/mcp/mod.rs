@@ -7,8 +7,12 @@
 //!   `/mcp` (see `bridge`), so there is still exactly one writer and every
 //!   change shows up live in open browsers.
 //!
-//! Changes are attributed to the user named in the `X-Kanban-User` header
-//! (`--as` for stdio); an unknown username is created as a new user.
+//! **Authentication is a real API token** (`Authorization: Bearer kbn_...`),
+//! the same one used everywhere else — never a client-supplied username.
+//! An MCP tool call runs with exactly the token owner's access: a token
+//! narrowed to one project can only see and touch that project through MCP,
+//! the same as through the REST API or the UI. There is no way for an MCP
+//! caller to act as anyone but the account the token belongs to.
 
 pub mod bridge;
 mod tools;
@@ -16,11 +20,12 @@ mod tools;
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Value, json};
 
-use crate::{AppState, inproc, router};
+use crate::auth::Auth;
+use crate::{AppState, router};
 
 /// Protocol revisions this server speaks, newest first. Tools-only servers
 /// behave the same under all of them.
@@ -32,9 +37,8 @@ and belong to projects (KAN). Each project has its own workflow statuses: call l
 get_project to see them, and move a ticket with update_ticket's `status`. Hierarchy: epics hold \
 stories, tasks and bugs; those hold subtasks. A \"blocks\" link from A to B means B cannot be \
 finished before A. Use list_ready_tickets to find work that is not blocked, and add_comment to \
-report progress or decisions on a ticket.";
-
-pub const USER_HEADER: &str = "x-kanban-user";
+report progress or decisions on a ticket. You only see the projects your API token has access to \
+— if a project or ticket seems to be missing, it may need to be shared with your account first.";
 
 fn error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
@@ -44,9 +48,11 @@ fn result(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
 
-/// `POST /mcp`. Replies 202 with no body to notifications and responses.
-pub async fn http(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    let user = headers.get(USER_HEADER).and_then(|v| v.to_str().ok()).map(str::to_string);
+/// `POST /mcp`. Requires the same bearer-token authentication as the rest of
+/// the API — enforced by the global auth middleware before this handler is
+/// even reached, so `Auth` below is always a real, checked identity. Replies
+/// 202 with no body to notifications and responses.
+pub async fn http(State(state): State<AppState>, Auth(p): Auth, body: Bytes) -> Response {
     let message: Value = match serde_json::from_slice(&body) {
         Ok(m) => m,
         Err(_) => {
@@ -54,7 +60,7 @@ pub async fn http(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                 .into_response();
         }
     };
-    match handle(&state, user.as_deref(), message).await {
+    match handle(&state, p, message).await {
         Some(reply) => Json(reply).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
@@ -66,7 +72,7 @@ pub async fn no_stream() -> StatusCode {
     StatusCode::METHOD_NOT_ALLOWED
 }
 
-pub async fn handle(state: &AppState, user: Option<&str>, message: Value) -> Option<Value> {
+pub async fn handle(state: &AppState, principal: crate::auth::Principal, message: Value) -> Option<Value> {
     if message.is_array() {
         return Some(error(Value::Null, -32600, "Batch requests are not supported"));
     }
@@ -97,10 +103,7 @@ pub async fn handle(state: &AppState, user: Option<&str>, message: Value) -> Opt
                 return Some(error(id, -32602, "tools/call needs a tool name"));
             };
             let args = params["arguments"].as_object().cloned().unwrap_or_default();
-            let ctx = match context(state, user).await {
-                Ok(ctx) => ctx,
-                Err(message) => return Some(result(id, tool_output(Err(message)))),
-            };
+            let ctx = tools::Ctx { app: router(state.clone()), principal };
             match tools::run(&ctx, name, &args).await {
                 Some(outcome) => result(id, tool_output(outcome)),
                 None => error(id, -32602, &format!("Unknown tool: {name}")),
@@ -118,37 +121,4 @@ fn tool_output(outcome: tools::ToolResult) -> Value {
         }),
         Err(message) => json!({ "content": [{ "type": "text", "text": message }], "isError": true }),
     }
-}
-
-/// The acting user for a tool call, created on first use so an agent can
-/// simply be configured with a name.
-async fn context(state: &AppState, user: Option<&str>) -> Result<tools::Ctx, String> {
-    let app = router(state.clone());
-    let actor = match user.map(str::trim).filter(|u| !u.is_empty()) {
-        None => None,
-        Some(name) => {
-            let existing: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE username = ?")
-                .bind(name)
-                .fetch_optional(&state.db)
-                .await
-                .map_err(|e| e.to_string())?;
-            match existing {
-                Some(id) => Some(id),
-                None => {
-                    let body = json!({ "username": name });
-                    let (status, user) = inproc::call(&app, Method::POST, "/api/users", None, Some(body))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    if status != 201 {
-                        return Err(format!(
-                            "Cannot act as \"{name}\": {}",
-                            user["error"]["message"].as_str().unwrap_or("invalid username")
-                        ));
-                    }
-                    user["id"].as_i64()
-                }
-            }
-        }
-    };
-    Ok(tools::Ctx { app, actor })
 }

@@ -1,3 +1,4 @@
+mod auth;
 mod comments;
 mod deletion;
 mod labels;
@@ -5,52 +6,47 @@ mod links;
 mod projects;
 mod settings;
 mod tickets;
+mod tokens;
 mod users;
 
+use std::collections::HashSet;
 use std::convert::Infallible;
 
-use axum::extract::{FromRequestParts, State};
-use axum::http::request::Parts;
+use axum::Json;
+use axum::Router;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, patch, post, put};
-use axum::{Json, Router};
 use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
+use sqlx::SqlitePool;
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::AppState;
-use crate::error::AppError;
-
-/// Who is making the change, from the `X-Actor: <user id>` header. There is
-/// no authentication: the board binds to localhost and trusts its callers,
-/// like the rest of ai-system. Absent means "system".
-pub struct Actor(pub Option<i64>);
-
-impl<S: Send + Sync> FromRequestParts<S> for Actor {
-    type Rejection = AppError;
-
-    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
-        match parts.headers.get("x-actor") {
-            None => Ok(Actor(None)),
-            Some(v) => v
-                .to_str()
-                .ok()
-                .and_then(|s| s.trim().parse().ok())
-                .map(|id| Actor(Some(id)))
-                .ok_or_else(|| AppError::invalid("X-Actor must be a user id")),
-        }
-    }
-}
+pub use crate::auth::Auth;
+use crate::auth::Principal;
+use axum::extract::State;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/mcp", post(crate::mcp::http).get(crate::mcp::no_stream))
         .route("/api/health", get(health))
         .route("/api/events", get(events))
+        .route("/api/auth/status", get(auth::status))
+        .route("/api/auth/setup", post(auth::setup))
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/password", post(auth::change_password))
+        .route("/api/tokens", get(tokens::list).post(tokens::create))
+        .route("/api/tokens/{id}", delete(tokens::revoke))
         .route("/api/users", get(users::list).post(users::create))
         .route("/api/users/{id}", patch(users::update))
         .route("/api/projects", get(projects::list).post(projects::create))
         .route("/api/projects/{key}", get(projects::get).patch(projects::update))
+        .route("/api/projects/{key}/members", get(projects::list_members))
+        .route(
+            "/api/projects/{key}/members/{user_id}",
+            put(projects::set_member).delete(projects::remove_member),
+        )
         .route("/api/projects/{key}/statuses", get(projects::list_statuses).post(projects::create_status))
         .route("/api/projects/{key}/statuses/order", put(projects::reorder_statuses))
         .route("/api/statuses/{id}", patch(projects::update_status).delete(projects::delete_status))
@@ -70,18 +66,59 @@ pub fn routes() -> Router<AppState> {
         .route("/api/settings", get(settings::get).patch(settings::update))
 }
 
-async fn health(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
-    let tickets: i64 = sqlx::query_scalar("SELECT count(*) FROM tickets").fetch_one(&state.db).await?;
-    Ok(Json(json!({ "ok": true, "tickets": tickets })))
+/// Public, so it says nothing about the board's contents.
+async fn health() -> Json<Value> {
+    Json(json!({ "ok": true }))
 }
 
-async fn events(State(state): State<AppState>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = BroadcastStream::new(state.events.subscribe()).map(|msg| {
-        Ok(match msg {
-            Ok(data) => Event::default().event("change").data(data),
-            // The client fell behind and missed events; tell it to refetch everything.
-            Err(_) => Event::default().event("resync").data("{}"),
-        })
+/// Keeps only what this subscriber may see: an event about a project they
+/// can't see is dropped, and invisible ticket keys are removed. Checked per
+/// event, so membership changes apply immediately.
+async fn visible_event(db: &SqlitePool, principal: &Principal, data: String) -> Option<String> {
+    let mut event: Value = serde_json::from_str(&data).ok()?;
+    let mut conn = db.acquire().await.ok()?;
+    let vis = principal.visibility(&mut conn).await.ok()?;
+    if let Some(pid) = event["project_id"].as_i64()
+        && !vis.sees(pid)
+    {
+        return None;
+    }
+    let keys: Vec<String> =
+        event["keys"].as_array().into_iter().flatten().filter_map(|k| k.as_str().map(String::from)).collect();
+    if keys.is_empty() {
+        return Some(data);
+    }
+    let projects: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, key FROM projects").fetch_all(&mut *conn).await.ok()?;
+    let visible: HashSet<String> =
+        projects.into_iter().filter(|(id, _)| vis.sees(*id)).map(|(_, key)| key).collect();
+    let kept: Vec<String> = keys
+        .into_iter()
+        .filter(|k| k.rsplit_once('-').is_some_and(|(project, _)| visible.contains(project)))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    event["keys"] = json!(kept);
+    Some(event.to_string())
+}
+
+async fn events(
+    State(state): State<AppState>,
+    Auth(principal): Auth,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let db = state.db.clone();
+    let stream = BroadcastStream::new(state.events.subscribe()).filter_map(move |msg| {
+        let (db, principal) = (db.clone(), principal.clone());
+        async move {
+            match msg {
+                Ok(data) => visible_event(&db, &principal, data)
+                    .await
+                    .map(|d| Ok(Event::default().event("change").data(d))),
+                // The client fell behind and missed events; tell it to refetch everything.
+                Err(_) => Some(Ok(Event::default().event("resync").data("{}"))),
+            }
+        }
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
