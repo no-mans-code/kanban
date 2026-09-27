@@ -55,12 +55,10 @@ fn origin_authority(origin: &str) -> Option<&str> {
 
 pub fn check(headers: &HeaderMap) -> Result<(), &'static str> {
     // In-process calls (tests, demo seeding) have no Host; browsers always send one.
-    if let Some(host) = headers.get(header::HOST) {
-        if !host.to_str().is_ok_and(allowed) {
-            return Err(
-                "Host is not allowed. Set KANBAN_ALLOWED_HOSTS to serve the board under another name.",
-            );
-        }
+    if let Some(host) = headers.get(header::HOST)
+        && !host.to_str().is_ok_and(allowed)
+    {
+        return Err("Host is not allowed. Set KANBAN_ALLOWED_HOSTS to serve the board under another name.");
     }
     if let Some(origin) = headers.get(header::ORIGIN) {
         let ok = origin.to_str().ok().and_then(origin_authority).is_some_and(allowed);
