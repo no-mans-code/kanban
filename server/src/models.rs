@@ -324,6 +324,13 @@ pub fn iso_date(ms: i64) -> String {
 
 /// Epoch milliseconds at UTC midnight for a `YYYY-MM-DD` date, or `None` if
 /// it doesn't parse. Inverse of `civil_date` (Howard Hinnant's algorithms).
+///
+/// The day-of-month range check below is deliberately loose (1..=31, not
+/// per-month) because the days-from-civil arithmetic doesn't reject an
+/// out-of-range day either — it just rolls over into the next month (e.g.
+/// "2026-02-30" silently becomes 2026-03-02). Catching that requires a
+/// round trip: convert forward, then check `civil_date` agrees on exactly
+/// the date we were given.
 pub fn parse_iso_date(s: &str) -> Option<i64> {
     let (y, rest) = s.split_once('-')?;
     let (m, d) = rest.split_once('-')?;
@@ -331,14 +338,15 @@ pub fn parse_iso_date(s: &str) -> Option<i64> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
+    let y0 = if m <= 2 { y - 1 } else { y };
+    let era = y0.div_euclid(400);
+    let yoe = y0 - era * 400;
     let mp = if m > 2 { m - 3 } else { m + 9 };
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
-    Some(days * 86_400_000)
+    let ms = days * 86_400_000;
+    (civil_date(ms) == (y, m as u32, d as u32)).then_some(ms)
 }
 
 pub async fn watch(conn: &mut SqliteConnection, ticket_id: i64, user: Option<i64>) -> ApiResult<()> {
@@ -376,5 +384,17 @@ mod tests {
         for s in ["", "not-a-date", "2026-13-01", "2026-01-40", "2026/09/27"] {
             assert!(parse_iso_date(s).is_none(), "{s} should not parse");
         }
+    }
+
+    #[test]
+    fn parse_iso_date_rejects_days_that_overflow_their_month() {
+        // 2026 isn't a leap year, so Feb has 28 days; April has 30, not 31.
+        // The days-from-civil math doesn't reject these on its own — it
+        // rolls over into the next month instead — so this is the bug the
+        // round-trip check in parse_iso_date exists to catch.
+        for s in ["2026-02-29", "2026-02-30", "2026-04-31", "2026-00-01", "2026-01-00"] {
+            assert!(parse_iso_date(s).is_none(), "{s} should not parse");
+        }
+        assert!(parse_iso_date("2024-02-29").is_some(), "2024 is a leap year");
     }
 }
