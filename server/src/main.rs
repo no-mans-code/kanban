@@ -3,7 +3,7 @@ use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kanban_server::{AppState, demo, events::Events, open_db, router};
+use kanban_server::{AppState, demo, events::Events, mcp, open_db, router};
 use tracing_subscriber::EnvFilter;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -32,6 +32,19 @@ async fn main() -> anyhow::Result<()> {
     let port: u16 = env_or("KANBAN_PORT", "8610").parse()?;
     if args.iter().any(|a| a == "healthcheck") {
         healthcheck(port);
+    }
+    if args.first().is_some_and(|a| a == "mcp") {
+        // stdio MCP transport. Runs before logging is set up: stdout carries
+        // only protocol messages.
+        let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
+        let url = value("--url")
+            .or_else(|| std::env::var("KANBAN_MCP_URL").ok())
+            .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
+        let user = value("--as").or_else(|| std::env::var("KANBAN_MCP_USER").ok());
+        let target = mcp::bridge::Target::parse(&url).map_err(anyhow::Error::msg)?;
+        let stdin = std::io::stdin().lock();
+        mcp::bridge::run(stdin, std::io::stdout().lock(), &target, user.as_deref())?;
+        return Ok(());
     }
 
     tracing_subscriber::fmt()

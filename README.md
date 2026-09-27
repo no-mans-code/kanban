@@ -8,6 +8,7 @@ the web UI embedded in it, backed by a single SQLite file.
 - **Backend:** Rust (axum, tokio, sqlx) + SQLite (WAL, FTS5 full-text search)
 - **Frontend:** Svelte 5 + TypeScript + Vite; Svelte Flow + ELK for the DAG view
 - **Live updates:** Server-Sent Events, so every open tab updates immediately
+- **AI agents:** a built-in MCP server (HTTP at `/mcp`, or stdio via `kanban-server mcp`)
 - **Themes:** dark (default, white text) and light, switchable with `T`
 
 Part of the `ai-system` project, where it will replace the minimal ticket
@@ -61,6 +62,44 @@ attacks from malicious websites (`server/src/guard.rs`).
 | `KANBAN_ALLOWED_HOSTS` | *(empty)* | Extra host names the board may be reached by, comma-separated (loopback names are always allowed). Needed only if you serve it on a LAN name or IP |
 | `KANBAN_DEMO` | `0` | `1` = same as `--demo` |
 | `RUST_LOG` | `kanban_server=info,tower_http=warn` | Log filter |
+
+### Connect AI agents (MCP)
+
+The board is also a [Model Context Protocol](https://modelcontextprotocol.io)
+server, so any MCP client can read and work the board through typed tools:
+`list_projects`, `get_project`, `list_users`, `search_tickets`,
+`list_ready_tickets` (what's unblocked and not done), `get_ticket`,
+`create_ticket`, `update_ticket`, `add_comment`, `link_tickets` and
+`unlink_tickets`. Tools take keys, status names, usernames and label names.
+They go through the same API as the UI, so cycle and height checks, history
+and live updates all apply. Deleting is deliberately not exposed to agents.
+
+The board must be running. Changes are attributed to the username you give
+(created automatically on first use):
+
+| Client | Setup |
+|---|---|
+| Claude Code | `claude mcp add --transport http kanban http://127.0.0.1:8610/mcp --header "X-Kanban-User: claude"` |
+| Any client with HTTP support | URL `http://127.0.0.1:8610/mcp`, header `X-Kanban-User: <username>` |
+| Any client with stdio only (Claude Desktop, Cursor, ...) | command `<path>/kanban/server/target/release/kanban-server`, args `["mcp", "--as", "<username>"]` |
+| Board in Docker, stdio client | command `docker`, args `["exec", "-i", "kanban-board", "kanban-server", "mcp", "--as", "<username>"]` |
+
+A typical JSON config for stdio clients:
+
+```json
+{
+  "mcpServers": {
+    "kanban": {
+      "command": "C:/path/to/kanban/server/target/release/kanban-server.exe",
+      "args": ["mcp", "--as", "claude"]
+    }
+  }
+}
+```
+
+`kanban-server mcp` forwards to `http://127.0.0.1:$KANBAN_PORT` (override with
+`--url` or `KANBAN_MCP_URL`) and returns a clear error if the board isn't
+running.
 
 ### Keyboard shortcuts
 
@@ -145,8 +184,13 @@ kanban/
     src/api/projects.rs             projects and their workflow statuses (create, rename, recategorize, reorder, delete-with-move)
     src/api/labels.rs, users.rs     labels (global) and people
     src/web.rs                      serves the embedded frontend (SPA fallback to index.html; /api/* never falls back)
+    src/inproc.rs                   calls the API in-process (used by demo seeding and MCP tools)
+    src/mcp/mod.rs                  MCP JSON-RPC: initialize, ping, tools/list, tools/call; POST /mcp handler
+    src/mcp/tools.rs                the MCP tools: schemas + implementations on top of the HTTP API
+    src/mcp/bridge.rs               `kanban-server mcp`: stdio <-> POST /mcp bridge (std-only HTTP/1.1 client)
     src/demo.rs                     first-run user + `--demo` data, created by calling the real API in-process
     tests/api.rs                    integration tests against a real temp SQLite file
+    tests/mcp.rs                    MCP protocol, an agent workflow end to end, and the stdio bridge over TCP
   web/                              Svelte 5 app (runes only; no legacy `export let` or stores)
     src/main.ts, App.svelte         mount; routing, keyboard shortcuts, same-origin link interception
     src/app.css                     design tokens (CSS variables) for dark/light + shared .btn/.input/.chip/.md styles
@@ -273,13 +317,21 @@ a table rebuild for that), `LINK_KINDS` in `models.rs`, `link_label()` in
 `tickets.rs`, and `LinkKind` / `LINK_CHOICES` in `types.ts`. Only `blocks`
 takes part in the DAG checks.
 
+**Add an MCP tool:** add its schema to `definitions()` and a match arm in
+`run()` in `server/src/mcp/tools.rs`, then implement it on `Ctx` by calling the
+HTTP API (`self.get` / `self.request`). Never touch the database directly from
+a tool, or it will skip validation, history and live events. Take human
+identifiers (keys, names) and return `Names::brief` shapes, never raw ids.
+Return `Err(message)` for problems the model can fix; it is shown with
+`isError: true`. Add a case to `tests/mcp.rs`.
+
 **Add a Settings tab:** add to `TABS` and a branch in `SettingsView.svelte`.
 Global settings go in the `settings` table through `api/settings.rs`.
 
 ### Checks to run after a change
 
 ```bash
-cd server && cargo fmt && cargo clippy --all-targets && cargo test   # 5 unit + 7 integration tests
+cd server && cargo fmt && cargo clippy --all-targets && cargo test   # unit + API + MCP tests
 cd web && npx svelte-check --tsconfig ./tsconfig.app.json && npm run build
 ```
 
@@ -304,6 +356,12 @@ suites don't cover the UI. Development with hot reload uses two terminals:
   so user text can never inject FTS syntax.
 - **Shell scripts need LF line endings** (`.gitattributes` enforces it). A CRLF
   shebang fails with "no such file or directory".
+- **Windows Smart App Control** can block freshly compiled test binaries
+  ("An Application Control policy has blocked this file"). That's the OS, not
+  a failing test. Retry, or run the suite in Docker:
+  `docker run --rm -v "$PWD:/src:ro" rust:1-bookworm bash -c "cp -r /src/server /w && cd /w && cargo test"`.
+- **MCP stdio must keep stdout clean:** `kanban-server mcp` exits before logging
+  is set up. Anything else printed to stdout would corrupt the protocol.
 - **Graceful shutdown is intentionally off:** open SSE streams would make
   Ctrl+C hang. SQLite in WAL mode is safe to stop at any time.
 

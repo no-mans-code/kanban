@@ -4,6 +4,8 @@ pub mod demo;
 pub mod error;
 pub mod events;
 pub mod guard;
+pub mod inproc;
+pub mod mcp;
 pub mod models;
 pub mod web;
 

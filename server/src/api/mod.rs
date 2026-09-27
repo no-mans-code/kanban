@@ -43,6 +43,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Actor {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route("/mcp", post(crate::mcp::http).get(crate::mcp::no_stream))
         .route("/api/health", get(health))
         .route("/api/events", get(events))
         .route("/api/users", get(users::list).post(users::create))

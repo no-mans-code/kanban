@@ -5,33 +5,10 @@ use std::collections::HashMap;
 
 use anyhow::{Context, bail};
 use axum::Router;
-use axum::body::Body;
-use axum::http::{Method, Request};
-use http_body_util::BodyExt;
+use axum::http::Method;
 use serde_json::{Value, json};
-use tower::ServiceExt;
 
-async fn call(
-    app: &Router,
-    method: Method,
-    uri: &str,
-    actor: Option<i64>,
-    body: Option<Value>,
-) -> anyhow::Result<(u16, Value)> {
-    let mut req = Request::builder().method(method).uri(uri).header("content-type", "application/json");
-    if let Some(a) = actor {
-        req = req.header("x-actor", a.to_string());
-    }
-    let req = req.body(match body {
-        Some(b) => Body::from(b.to_string()),
-        None => Body::empty(),
-    })?;
-    let res = app.clone().oneshot(req).await?;
-    let status = res.status().as_u16();
-    let bytes = res.into_body().collect().await?.to_bytes();
-    let value = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes)? };
-    Ok((status, value))
-}
+use crate::inproc::call;
 
 async fn ok(
     app: &Router,
