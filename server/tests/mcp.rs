@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use axum::Router;
 use axum::body::Body;
 use axum::http::Request;
@@ -7,10 +9,11 @@ use kanban_server::{AppState, open_db, router};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+#[derive(Clone)]
 struct Mcp {
     app: Router,
     token: String,
-    _dir: tempfile::TempDir,
+    _dir: std::sync::Arc<tempfile::TempDir>,
 }
 
 /// A response's `Set-Cookie` value, stripped of the attributes, ready to
@@ -61,7 +64,7 @@ impl Mcp {
         let token = created["token"].as_str().unwrap().to_string();
         assert!(token.starts_with("kbn_"));
 
-        Mcp { app, token, _dir: dir }
+        Mcp { app, token, _dir: std::sync::Arc::new(dir) }
     }
 
     async fn send(&self, message: Value) -> (u16, Value) {
@@ -251,6 +254,104 @@ async fn due_dates_round_trip_as_plain_calendar_dates() {
     let (err, cleared) = m.tool("update_ticket", json!({ "key": "KAN-1", "due_date": null })).await;
     assert!(!err, "{cleared}");
     assert_eq!(cleared["due_date"], Value::Null);
+}
+
+/// Cheap xorshift64: good enough to spread test load, not meant to be secure.
+fn xorshift(mut x: u64) -> u64 {
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    x
+}
+
+/// Kahn's algorithm as an independent second opinion on acyclicity: the
+/// server's own write path already refuses any link that would create a
+/// cycle (see `dag.rs`), so this is deliberately *not* calling into that
+/// same code — it's here to catch a race that let one slip through anyway.
+fn is_acyclic(edges: &[(i64, i64)]) -> bool {
+    let mut indeg: HashMap<i64, i32> = HashMap::new();
+    let mut adj: HashMap<i64, Vec<i64>> = HashMap::new();
+    for &(s, t) in edges {
+        adj.entry(s).or_default().push(t);
+        *indeg.entry(t).or_insert(0) += 1;
+        indeg.entry(s).or_insert(0);
+    }
+    let mut queue: Vec<i64> = indeg.iter().filter(|&(_, &d)| d == 0).map(|(&n, _)| n).collect();
+    let mut seen = 0;
+    while let Some(n) = queue.pop() {
+        seen += 1;
+        for &m in adj.get(&n).into_iter().flatten() {
+            let d = indeg.get_mut(&m).unwrap();
+            *d -= 1;
+            if *d == 0 {
+                queue.push(m);
+            }
+        }
+    }
+    seen == indeg.len()
+}
+
+async fn get_rest(app: &Router, token: &str, uri: &str) -> Value {
+    let req =
+        Request::get(uri).header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    serde_json::from_slice(&res.into_body().collect().await.unwrap().to_bytes()).unwrap()
+}
+
+/// Many "agents" (tokio tasks, one token) hammering the same project through
+/// MCP concurrently, calling a pseudo-random tool with pseudo-random-but
+/// plausible arguments each time — real invariant coverage across the whole
+/// tool surface without hand-writing a scenario per tool. `m.tool()` already
+/// asserts every call gets a clean HTTP 200 (a panic or a dropped connection
+/// under contention would fail that), so the loop itself is most of the
+/// test; what's checked after is what a race could still slip past that.
+#[tokio::test]
+async fn agents_hammering_the_board_concurrently_leave_it_consistent() {
+    let m = Mcp::new().await;
+    let mut tasks = Vec::new();
+    for task in 0..8u64 {
+        let m = m.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut seed = task ^ 0xDEAD_BEEF_u64;
+            for i in 0..20u64 {
+                seed = xorshift(seed.wrapping_add(i));
+                let key = format!("KAN-{}", 1 + seed % 40);
+                let other = format!("KAN-{}", 1 + (seed / 7) % 40);
+                let (name, args) = match seed % 5 {
+                    0 => ("create_ticket", json!({ "project": "KAN", "title": format!("t{task}-{i}") })),
+                    1 => {
+                        let priority = if seed.is_multiple_of(2) { "low" } else { "high" };
+                        ("update_ticket", json!({ "key": key, "priority": priority }))
+                    }
+                    2 => ("link_tickets", json!({ "source": key, "target": other })),
+                    3 => ("add_comment", json!({ "key": key, "body": "stress" })),
+                    _ => ("get_ticket", json!({ "key": key })),
+                };
+                m.tool(name, args).await;
+            }
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    // Ticket numbering stayed unique per project under concurrent creation.
+    let (_, found) = m.tool("search_tickets", json!({ "project": "KAN", "limit": 200 })).await;
+    let keys: Vec<&str> =
+        found["tickets"].as_array().unwrap().iter().map(|t| t["key"].as_str().unwrap()).collect();
+    let unique: HashSet<&str> = keys.iter().copied().collect();
+    assert_eq!(keys.len(), unique.len(), "duplicate ticket key under concurrent creation: {keys:?}");
+
+    // No cycle got through despite many concurrent link_tickets calls racing.
+    let graph = get_rest(&m.app, &m.token, "/api/graph?project=KAN").await;
+    let edges: Vec<(i64, i64)> = graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["source"].as_i64().unwrap(), e["target"].as_i64().unwrap()))
+        .collect();
+    assert!(is_acyclic(&edges), "a cycle got through under concurrent linking: {edges:?}");
 }
 
 /// The core promise this session's auth work is for: a token narrowed to
