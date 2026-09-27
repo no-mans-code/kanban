@@ -34,6 +34,10 @@ export function setActor(id: number | null) {
 }
 
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  return (await send(method, path, body)).data as T
+}
+
+async function send(method: string, path: string, body?: unknown): Promise<{ data: unknown; res: Response }> {
   const headers: Record<string, string> = {}
   if (body !== undefined) headers['content-type'] = 'application/json'
   if (actor !== null) headers['x-actor'] = String(actor)
@@ -43,13 +47,27 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   } catch {
     throw new ApiError(0, 'offline', 'Cannot reach the board server')
   }
-  if (res.status === 204) return undefined as T
+  if (res.status === 204) return { data: undefined, res }
   const data = await res.json().catch(() => null)
   if (!res.ok) {
     const err = data?.error
     throw new ApiError(res.status, err?.code ?? 'http', err?.message ?? res.statusText, err?.detail)
   }
-  return data as T
+  return { data, res }
+}
+
+const PAGE = 5000
+
+/** Every ticket matching `q`, following pages until X-Total-Count is reached. */
+async function allTickets(q: TicketQuery): Promise<TicketSummary[]> {
+  const out: TicketSummary[] = []
+  for (;;) {
+    const { data, res } = await send('GET', `/api/tickets${query({ ...q, limit: PAGE, offset: out.length })}`)
+    const page = data as TicketSummary[]
+    out.push(...page)
+    const total = Number(res.headers.get('x-total-count') ?? out.length)
+    if (page.length === 0 || out.length >= total) return out
+  }
 }
 
 const enc = encodeURIComponent
@@ -75,6 +93,7 @@ export interface TicketQuery {
   q?: string
   sort?: 'rank' | 'updated' | 'created' | 'priority' | 'key'
   limit?: number
+  offset?: number
 }
 
 export interface TicketInput {
@@ -129,7 +148,9 @@ export const api = {
     request<Label>('PATCH', `/api/labels/${id}`, body),
   deleteLabel: (id: number) => request<void>('DELETE', `/api/labels/${id}`),
 
+  /** One page (default 2000). For views that must show everything, use allTickets. */
   tickets: (q: TicketQuery) => request<TicketSummary[]>('GET', `/api/tickets${query({ ...q })}`),
+  allTickets,
   ticket: (key: string) => request<TicketDetail>('GET', `/api/tickets/${enc(key)}`),
   createTicket: (body: TicketInput) => request<TicketDetail>('POST', '/api/tickets', body),
   updateTicket: (key: string, body: TicketPatch) =>

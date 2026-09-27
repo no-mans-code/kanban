@@ -329,3 +329,37 @@ async fn foreign_hosts_and_origins_are_rejected() {
     assert_eq!(with_headers(&t, Method::GET, "/api/users", &[("host", "localhost:5173")]).await, 200);
     assert_eq!(with_headers(&t, Method::GET, "/api/health", &[("host", "[::1]:8610")]).await, 200);
 }
+
+async fn page(t: &TestApp, uri: &str) -> (Vec<String>, i64) {
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let res = t.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), 200);
+    let total = res.headers()["x-total-count"].to_str().unwrap().parse().unwrap();
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let rows: Value = serde_json::from_slice(&bytes).unwrap();
+    (rows.as_array().unwrap().iter().map(|r| r["key"].as_str().unwrap().to_string()).collect(), total)
+}
+
+#[tokio::test]
+async fn listing_pages_through_every_ticket() {
+    let t = TestApp::new().await;
+    t.setup().await;
+    for i in 0..7 {
+        let priority = if i % 2 == 0 { "high" } else { "low" };
+        t.ticket(&format!("t{i}"), json!({ "priority": priority })).await;
+    }
+    let mut seen = Vec::new();
+    for offset in [0, 3, 6] {
+        let (keys, total) =
+            page(&t, &format!("/api/tickets?project=KAN&sort=key&limit=3&offset={offset}")).await;
+        assert_eq!(total, 7);
+        seen.extend(keys);
+    }
+    let expected: Vec<String> = (1..=7).map(|n| format!("KAN-{n}")).collect();
+    assert_eq!(seen, expected, "no ticket skipped or repeated across pages");
+
+    let (keys, total) = page(&t, "/api/tickets?project=KAN&priority=high&limit=2").await;
+    assert_eq!((keys.len(), total), (2, 4), "the total respects filters, not the page size");
+    let (keys, total) = page(&t, "/api/tickets?project=KAN&offset=50").await;
+    assert_eq!((keys.len(), total), (0, 7));
+}

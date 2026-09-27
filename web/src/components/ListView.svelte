@@ -21,7 +21,7 @@
 
   $effect(() => {
     void app.ticketsVersion
-    api.tickets({ project: project.key, sort: 'key' }).then(
+    api.allTickets({ project: project.key, sort: 'key' }).then(
       (t) => (tickets = t),
       (e) => toasts.error(e),
     )

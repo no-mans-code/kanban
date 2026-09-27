@@ -209,7 +209,7 @@ Send `X-Actor: <user id>` on writes to attribute them. Errors look like
 | `PUT /projects/{key}/statuses/order` | `{ids: [...]}`, every status exactly once |
 | `PATCH /statuses/{id}`, `DELETE /statuses/{id}?move_to={id}` | Rename / recategorize; delete (tickets must move somewhere) |
 | `GET/POST /labels`, `PATCH/DELETE /labels/{id}` | Labels |
-| `GET /tickets` | Filters: `project`, `status_id`, `assignee` (id or `none`), `type`, `priority`, `label_id`, `parent` (key), `watcher`, `q` (full-text + exact key), `sort` (`rank`/`updated`/`created`/`priority`/`key`), `limit` (≤ 5000) |
+| `GET /tickets` | Filters: `project`, `status_id`, `assignee` (id or `none`), `type`, `priority`, `label_id`, `parent` (key), `watcher`, `q` (full-text + exact key), `sort` (`rank`/`updated`/`created`/`priority`/`key`), `limit` (default 2000, max 5000), `offset`. The `X-Total-Count` header gives the number of matches across all pages; `api.allTickets()` in the web client pages through them |
 | `POST /tickets` | `{project, type, title, description?, priority?, status_id?, assignee_id?, parent? (key), label_ids?, watcher_ids?}` |
 | `GET /tickets/{key}` | Summary + `description`, `watcher_ids`, `children`, `links` |
 | `PATCH /tickets/{key}` | Any of `title, description, type, priority, status_id, assignee_id (null to clear), parent (key or null), label_ids` |

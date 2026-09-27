@@ -30,7 +30,7 @@
 
   async function load(key: string) {
     try {
-      tickets = await api.tickets({ project: key, sort: 'rank' })
+      tickets = await api.allTickets({ project: key, sort: 'rank' })
       loaded = true
     } catch (e) {
       toasts.error(e)

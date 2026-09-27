@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderName, StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, QueryBuilder, Sqlite, SqliteConnection};
 
@@ -36,7 +36,11 @@ pub struct ListQuery {
     /// rank (default) | updated | created | priority | key
     sort: Option<String>,
     limit: Option<i64>,
+    offset: Option<i64>,
 }
+
+/// Page size cap. Callers page with `offset` and read `X-Total-Count`.
+pub const MAX_PAGE: i64 = 5000;
 
 /// Turn free text into a safe FTS5 prefix query. Non-word characters are
 /// dropped, which matches how the unicode61 tokenizer splits text anyway and
@@ -50,16 +54,8 @@ fn fts_query(q: &str) -> Option<String> {
     (!terms.is_empty()).then(|| terms.join(" "))
 }
 
-pub async fn list(
-    State(state): State<AppState>,
-    Query(q): Query<ListQuery>,
-) -> ApiResult<Json<Vec<TicketSummary>>> {
-    let mut conn = state.db.acquire().await?;
-    let parent_id = match &q.parent {
-        Some(k) => Some(resolve_key(&mut conn, k).await?),
-        None => None,
-    };
-    let mut qb = QueryBuilder::<Sqlite>::new(SUMMARY_SELECT);
+/// The WHERE clause shared by the page query and the count query.
+fn push_filters(qb: &mut QueryBuilder<Sqlite>, q: &ListQuery, parent_id: Option<i64>) -> ApiResult<()> {
     qb.push(" WHERE 1 = 1");
     if let Some(project) = &q.project {
         qb.push(" AND p.key = ").push_bind(project.to_ascii_uppercase());
@@ -106,20 +102,48 @@ pub async fn list(
         }
         qb.push(")");
     }
-    qb.push(match q.sort.as_deref().unwrap_or("rank") {
+    Ok(())
+}
+
+/// One page of matching tickets. `X-Total-Count` carries the number of
+/// matches across all pages, so a client can tell it has everything.
+pub async fn list(
+    State(state): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> ApiResult<([(HeaderName, String); 1], Json<Vec<TicketSummary>>)> {
+    // Every order ends in a unique column so pages never overlap or skip.
+    let order = match q.sort.as_deref().unwrap_or("rank") {
         "rank" => " ORDER BY s.position, t.rank, t.id",
         "updated" => " ORDER BY t.updated_at DESC, t.id DESC",
         "created" => " ORDER BY t.created_at DESC, t.id DESC",
         "key" => " ORDER BY p.key, t.number",
         "priority" => {
             " ORDER BY CASE t.priority WHEN 'highest' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
-                                       WHEN 'low' THEN 3 ELSE 4 END, t.updated_at DESC"
+                                       WHEN 'low' THEN 3 ELSE 4 END, t.updated_at DESC, t.id DESC"
         }
         _ => return Err(AppError::invalid("sort must be rank, updated, created, priority or key")),
-    });
-    qb.push(" LIMIT ").push_bind(q.limit.unwrap_or(2000).clamp(1, 5000));
+    };
+    let mut conn = state.db.acquire().await?;
+    let parent_id = match &q.parent {
+        Some(k) => Some(resolve_key(&mut conn, k).await?),
+        None => None,
+    };
+
+    let mut count = QueryBuilder::<Sqlite>::new(
+        "SELECT count(*) FROM tickets t
+           JOIN projects p ON p.id = t.project_id
+           JOIN statuses s ON s.id = t.status_id",
+    );
+    push_filters(&mut count, &q, parent_id)?;
+    let total: i64 = count.build_query_scalar().fetch_one(&mut *conn).await?;
+
+    let mut qb = QueryBuilder::<Sqlite>::new(SUMMARY_SELECT);
+    push_filters(&mut qb, &q, parent_id)?;
+    qb.push(order);
+    qb.push(" LIMIT ").push_bind(q.limit.unwrap_or(2000).clamp(1, MAX_PAGE));
+    qb.push(" OFFSET ").push_bind(q.offset.unwrap_or(0).max(0));
     let rows = qb.build_query_as::<TicketSummary>().fetch_all(&mut *conn).await?;
-    Ok(Json(rows))
+    Ok(([(HeaderName::from_static("x-total-count"), total.to_string())], Json(rows)))
 }
 
 // ---------------------------------------------------------------- detail

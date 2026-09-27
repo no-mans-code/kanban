@@ -15,7 +15,7 @@
       return
     }
     try {
-      const hits = await api.tickets({ project: key, q, limit: 1000 })
+      const hits = await api.allTickets({ project: key, q })
       if (filters.text === q) filters.serverHits = new Set(hits.map((h) => h.key))
     } catch {
       filters.serverHits = null
