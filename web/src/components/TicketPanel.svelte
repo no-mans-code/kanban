@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from 'svelte'
   import { api, type TicketPatch } from '../lib/api'
   import { capitalize, fullTime, relativeTime } from '../lib/format'
   import { projectUrl, router } from '../lib/router.svelte'
@@ -65,8 +66,31 @@
   }
 
   $effect(() => {
-    void app.ticketsVersion
     load(ticketKey)
+  })
+
+  /** Tickets whose changes show up in this panel: itself, its parent, children and links. */
+  function shown(key: string): Set<string> {
+    const keys = new Set([key])
+    if (detail?.key === key) {
+      if (detail.parent_key) keys.add(detail.parent_key)
+      for (const c of detail.children) keys.add(c.key)
+      for (const l of detail.links) keys.add(l.ticket.key)
+    }
+    return keys
+  }
+
+  // Live updates: refetch only when a change batch touches something shown here.
+  let seenVersion = app.ticketsVersion
+  $effect(() => {
+    const version = app.ticketsVersion
+    if (version === seenVersion) return
+    seenVersion = version
+    untrack(() => {
+      const changed = app.changedKeys
+      const relevant = shown(ticketKey)
+      if (changed === null || [...changed].some((k) => relevant.has(k))) load(ticketKey)
+    })
   })
 
   $effect(() => {

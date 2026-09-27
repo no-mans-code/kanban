@@ -23,9 +23,10 @@
   let limit = $state(5)
   let limitError = $state<string | null>(null)
 
+  // settingsVersion also moves when links change or tickets are deleted, the
+  // only ticket changes that can alter the dependency height shown here.
   $effect(() => {
     void app.settingsVersion
-    void app.ticketsVersion
     api.settings().then((s) => {
       settings = s
       unlimited = s.max_dag_height === null

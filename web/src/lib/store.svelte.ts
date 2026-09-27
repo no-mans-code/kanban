@@ -1,6 +1,7 @@
 import { api, setActor } from './api'
 import type { ChangeEvent, Label, Project, ProjectDetail, User } from './types'
 
+const COALESCE_MS = 150
 const THEME_KEY = 'kanban.theme'
 const ACTOR_KEY = 'kanban.actor'
 
@@ -31,10 +32,22 @@ class AppStore {
   connected = $state(false)
   ready = $state(false)
 
-  /** Bumped on every ticket/comment/link change anywhere; views refetch on it. */
+  /**
+   * Bumped at most once per COALESCE_MS for ticket, comment and link changes;
+   * views refetch on it. `changedKeys` lists the tickets touched in that
+   * batch, or is null when anything may have changed (resync, label or
+   * workflow edits).
+   */
   ticketsVersion = $state(0)
+  changedKeys = $state<ReadonlySet<string> | null>(null)
+  /** Bumped when settings or the dependency graph may have changed. */
   settingsVersion = $state(0)
-  lastChange = $state<ChangeEvent | null>(null)
+
+  private pendingKeys = new Set<string>()
+  private pendingAll = false
+  private pendingTickets = false
+  private pendingSettings = false
+  private flushTimer: ReturnType<typeof setTimeout> | undefined
 
   usersById = $derived(new Map(this.users.map((u) => [u.id, u])))
   labelsById = $derived(new Map(this.labels.map((l) => [l.id, l])))
@@ -105,18 +118,47 @@ class AppStore {
     if (scope === 'user') this.loadUsers()
     else if (scope === 'label') {
       this.loadLabels()
-      this.ticketsVersion++
+      this.queue({ all: true })
     } else if (scope === 'project') {
       this.loadProjects()
       if (change.project_id === null || change.project_id === this.project?.id) {
         this.reloadProject()
-        this.ticketsVersion++
+        this.queue({ all: true })
       }
-    } else if (scope === 'settings') this.settingsVersion++
+    } else if (scope === 'settings') this.queue({ settings: true })
     else {
-      this.lastChange = change
+      // Links and deletions can change the dependency graph's height.
+      const graph = scope === 'link' || change.type === 'ticket.deleted'
+      this.queue({ keys: change.keys, settings: graph })
+    }
+  }
+
+  /**
+   * Agents can change many tickets in a burst. Collect everything that arrives
+   * within a short window and let views refetch once for the whole batch.
+   */
+  private queue(what: { keys?: string[]; all?: boolean; settings?: boolean }) {
+    if (what.keys) {
+      this.pendingTickets = true
+      for (const k of what.keys) this.pendingKeys.add(k)
+    }
+    if (what.all) {
+      this.pendingTickets = true
+      this.pendingAll = true
+    }
+    if (what.settings) this.pendingSettings = true
+    this.flushTimer ??= setTimeout(() => this.flush(), COALESCE_MS)
+  }
+
+  private flush() {
+    this.flushTimer = undefined
+    if (this.pendingTickets) {
+      this.changedKeys = this.pendingAll ? null : new Set(this.pendingKeys)
       this.ticketsVersion++
     }
+    if (this.pendingSettings) this.settingsVersion++
+    this.pendingKeys.clear()
+    this.pendingAll = this.pendingTickets = this.pendingSettings = false
   }
 
   private resync() {
@@ -124,8 +166,7 @@ class AppStore {
     this.loadLabels()
     this.loadProjects()
     this.reloadProject()
-    this.ticketsVersion++
-    this.settingsVersion++
+    this.queue({ all: true, settings: true })
   }
 }
 
