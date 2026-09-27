@@ -93,6 +93,7 @@ pub struct Status {
     pub name: String,
     pub category: String,
     pub position: i64,
+    pub wip_limit: Option<i64>,
 }
 
 #[derive(Serialize, FromRow)]

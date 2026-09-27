@@ -8,7 +8,9 @@ use sqlx::SqliteConnection;
 
 use crate::auth::{Auth, Principal, Role};
 use crate::error::{ApiResult, AppError};
-use crate::models::{CATEGORIES, Project, Status, check_one_of, log_activity, project_id_by_key};
+use crate::models::{
+    CATEGORIES, Project, Status, check_one_of, double_option, log_activity, project_id_by_key,
+};
 use crate::{AppState, now_ms, write_tx};
 
 const DEFAULT_STATUSES: [(&str, &str); 4] =
@@ -32,7 +34,7 @@ pub struct ProjectItem {
 
 async fn load_statuses(conn: &mut SqliteConnection, project_id: i64) -> ApiResult<Vec<Status>> {
     Ok(sqlx::query_as::<_, Status>(
-        "SELECT id, project_id, name, category, position FROM statuses
+        "SELECT id, project_id, name, category, position, wip_limit FROM statuses
           WHERE project_id = ? ORDER BY position, id",
     )
     .bind(project_id)
@@ -241,7 +243,7 @@ pub async fn create_status(
 /// the caller is concerned, it doesn't exist.
 async fn status_row(conn: &mut SqliteConnection, p: &Principal, id: i64) -> ApiResult<Status> {
     let status = sqlx::query_as::<_, Status>(
-        "SELECT id, project_id, name, category, position FROM statuses WHERE id = ?",
+        "SELECT id, project_id, name, category, position, wip_limit FROM statuses WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&mut *conn)
@@ -274,6 +276,9 @@ async fn sync_resolved(conn: &mut SqliteConnection, status_id: i64, category: &s
 pub struct UpdateStatus {
     name: Option<String>,
     category: Option<String>,
+    /// A positive column cap, or null to remove the limit.
+    #[serde(default, deserialize_with = "double_option")]
+    wip_limit: Option<Option<i64>>,
 }
 
 pub async fn update_status(
@@ -303,6 +308,16 @@ pub async fn update_status(
                 .await?;
             sync_resolved(&mut tx, id, &category).await?;
         }
+    }
+    if let Some(wip_limit) = body.wip_limit {
+        if wip_limit.is_some_and(|n| n < 1) {
+            return Err(AppError::invalid("The WIP limit must be at least 1"));
+        }
+        sqlx::query("UPDATE statuses SET wip_limit = ? WHERE id = ?")
+            .bind(wip_limit)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
     }
     let statuses = load_statuses(&mut tx, status.project_id).await?;
     tx.commit().await?;

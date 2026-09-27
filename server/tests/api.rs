@@ -316,6 +316,33 @@ async fn due_dates_are_settable_sortable_and_filter_overdue() {
 }
 
 #[tokio::test]
+async fn wip_limits_are_settable_validated_and_clearable() {
+    let t = TestApp::new().await;
+    let project = t.setup().await;
+    let todo = status_id(&project, "To Do");
+
+    let statuses = t.ok(Method::PATCH, &format!("/api/statuses/{todo}"), json!({ "wip_limit": 3 })).await;
+    let s = statuses.as_array().unwrap().iter().find(|s| s["id"] == todo).unwrap();
+    assert_eq!(s["wip_limit"], 3);
+
+    // It's advisory, not enforced: tickets past the limit still move in fine.
+    for i in 0..5 {
+        t.ticket(&format!("t{i}"), json!({ "status_id": todo })).await;
+    }
+    let over = t.get(&format!("/api/projects/{}", project["key"].as_str().unwrap())).await;
+    let s = over["statuses"].as_array().unwrap().iter().find(|s| s["id"] == todo).unwrap();
+    assert_eq!(s["wip_limit"], 3, "still reports the configured limit, not enforcing it");
+
+    let (status, body) =
+        t.req(Method::PATCH, &format!("/api/statuses/{todo}"), Some(json!({ "wip_limit": 0 }))).await;
+    assert_eq!(status, 400, "{body}");
+
+    let cleared = t.ok(Method::PATCH, &format!("/api/statuses/{todo}"), json!({ "wip_limit": null })).await;
+    let s = cleared.as_array().unwrap().iter().find(|s| s["id"] == todo).unwrap();
+    assert_eq!(s["wip_limit"], Value::Null);
+}
+
+#[tokio::test]
 async fn deleting_a_status_in_use_needs_a_destination() {
     let t = TestApp::new().await;
     let project = t.setup().await;

@@ -240,6 +240,20 @@
               >
                 {#each CATEGORIES as c (c)}<option value={c}>{CATEGORY_NAMES[c]}</option>{/each}
               </select>
+              <input
+                class="input wip"
+                type="number"
+                min="1"
+                placeholder="No limit"
+                value={s.wip_limit ?? ''}
+                disabled={!canEditWorkflow}
+                title="WIP limit for this column"
+                aria-label="WIP limit"
+                onchange={(e) => {
+                  const n = e.currentTarget.value.trim()
+                  wfCall(() => api.updateStatus(s.id, { wip_limit: n === '' ? null : Math.max(1, Number(n)) }))
+                }}
+              />
               {#if canEditWorkflow}
                 <button class="icon-btn" title="Move left" disabled={i === 0} onclick={() => move(i, -1)}><Icon name="up" size={14} /></button>
                 <button class="icon-btn" title="Move right" disabled={i === wf.statuses.length - 1} onclick={() => move(i, 1)}><Icon name="down" size={14} /></button>
@@ -429,6 +443,10 @@
   }
   .cat {
     width: 150px;
+  }
+  .wip {
+    width: 80px;
+    flex: none;
   }
   .swatch {
     width: 32px;

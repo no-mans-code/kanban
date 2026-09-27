@@ -169,7 +169,8 @@ export const api = {
   removeMember: (key: string, userId: number) => request<ProjectMember[]>('DELETE', `/api/projects/${enc(key)}/members/${userId}`),
 
   createStatus: (key: string, body: { name: string; category: string }) => request<Status[]>('POST', `/api/projects/${enc(key)}/statuses`, body),
-  updateStatus: (id: number, body: Partial<{ name: string; category: string }>) => request<Status[]>('PATCH', `/api/statuses/${id}`, body),
+  updateStatus: (id: number, body: Partial<{ name: string; category: string; wip_limit: number | null }>) =>
+    request<Status[]>('PATCH', `/api/statuses/${id}`, body),
   deleteStatus: (id: number, moveTo?: number) => request<Status[]>('DELETE', `/api/statuses/${id}${query({ move_to: moveTo })}`),
   reorderStatuses: (key: string, ids: number[]) => request<Status[]>('PUT', `/api/projects/${enc(key)}/statuses/order`, { ids }),
 

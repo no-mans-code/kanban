@@ -99,6 +99,7 @@ export interface Status {
   name: string
   category: Category
   position: number
+  wip_limit: number | null
 }
 
 export interface ProjectDetail extends Project {

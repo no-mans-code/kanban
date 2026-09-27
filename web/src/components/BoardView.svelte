@@ -158,7 +158,9 @@
       <header>
         <span class="dot"></span>
         <h2>{status.name}</h2>
-        <span class="count">{items.length === total ? total : `${items.length}/${total}`}</span>
+        <span class="count" class:over={status.wip_limit !== null && total > status.wip_limit} title={status.wip_limit !== null && total > status.wip_limit ? `Over the WIP limit of ${status.wip_limit}` : undefined}>
+          {items.length === total ? total : `${items.length}/${total}`}{status.wip_limit !== null ? ` / ${status.wip_limit}` : ''}
+        </span>
         <span class="spacer"></span>
         <button class="icon-btn" title="Add a ticket to {status.name}" onclick={() => (adding = status.id)}>
           <Icon name="plus" size={15} />
@@ -257,6 +259,10 @@
   .count {
     font-size: 12px;
     color: var(--text-3);
+  }
+  .count.over {
+    color: var(--danger);
+    font-weight: 600;
   }
   .spacer {
     flex: 1;
