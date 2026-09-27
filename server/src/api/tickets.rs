@@ -10,8 +10,8 @@ use crate::auth::{Auth, Principal, Role};
 use crate::error::{ApiResult, AppError};
 use crate::models::{
     Activity, PRIORITIES, SUMMARY_SELECT, TYPES, TicketSummary, check_one_of, clean_title, double_option,
-    log_activity, project_id_by_key, reindex, resolve_key, summaries, summary, ticket_key, user_name,
-    valid_parent, watch,
+    iso_date, log_activity, project_id_by_key, reindex, resolve_key, summaries, summary, ticket_key,
+    user_name, valid_parent, watch,
 };
 use crate::{AppState, now_ms, write_tx};
 
@@ -33,7 +33,9 @@ pub struct ListQuery {
     parent: Option<String>,
     watcher: Option<i64>,
     q: Option<String>,
-    /// rank (default) | updated | created | priority | key
+    /// True to show only tickets with a due date in the past that aren't done.
+    overdue: Option<bool>,
+    /// rank (default) | updated | created | priority | due | key
     sort: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
@@ -115,6 +117,11 @@ fn push_filters(
             .push_bind(user)
             .push(")");
     }
+    if q.overdue == Some(true) {
+        qb.push(" AND t.due_date IS NOT NULL AND t.due_date < ")
+            .push_bind(now_ms())
+            .push(" AND s.category <> 'done'");
+    }
     if let Some(text) = q.q.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         qb.push(" AND ((p.key || '-' || t.number) = ").push_bind(text.to_ascii_uppercase());
         if let Some(fts) = fts_query(text) {
@@ -144,7 +151,8 @@ pub async fn list(
             " ORDER BY CASE t.priority WHEN 'highest' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
                                        WHEN 'low' THEN 3 ELSE 4 END, t.updated_at DESC, t.id DESC"
         }
-        _ => return Err(AppError::invalid("sort must be rank, updated, created, priority or key")),
+        "due" => " ORDER BY t.due_date IS NULL, t.due_date, t.id",
+        _ => return Err(AppError::invalid("sort must be rank, updated, created, priority, due or key")),
     };
     let mut conn = state.db.acquire().await?;
     let parent_id = match &q.parent {
@@ -282,11 +290,12 @@ struct TicketRow {
     priority: String,
     assignee_id: Option<i64>,
     parent_id: Option<i64>,
+    due_date: Option<i64>,
 }
 
 async fn load_row(conn: &mut SqliteConnection, id: i64) -> ApiResult<TicketRow> {
     Ok(sqlx::query_as::<_, TicketRow>(
-        "SELECT id, project_id, type AS ticket_type, title, description, status_id, priority, assignee_id, parent_id
+        "SELECT id, project_id, type AS ticket_type, title, description, status_id, priority, assignee_id, parent_id, due_date
            FROM tickets WHERE id = ?",
     )
     .bind(id)
@@ -425,6 +434,7 @@ pub struct CreateTicket {
     label_ids: Vec<i64>,
     #[serde(default)]
     watcher_ids: Vec<i64>,
+    due_date: Option<i64>,
 }
 
 pub async fn create(
@@ -473,8 +483,8 @@ pub async fn create(
     let now = now_ms();
     let id = sqlx::query(
         "INSERT INTO tickets (project_id, number, type, title, description, status_id, priority,
-                              assignee_id, reporter_id, parent_id, rank, created_at, updated_at, resolved_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                              assignee_id, reporter_id, parent_id, rank, created_at, updated_at, resolved_at, due_date)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(project_id)
     .bind(number)
@@ -490,6 +500,7 @@ pub async fn create(
     .bind(now)
     .bind(now)
     .bind((category == "done").then_some(now))
+    .bind(body.due_date)
     .execute(&mut *tx)
     .await?
     .last_insert_rowid();
@@ -525,6 +536,8 @@ pub struct UpdateTicket {
     #[serde(default, deserialize_with = "double_option")]
     parent: Option<Option<String>>,
     label_ids: Option<Vec<i64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    due_date: Option<Option<i64>>,
 }
 
 pub async fn update(
@@ -597,6 +610,26 @@ pub async fn update(
             .await?;
             changed = true;
         }
+    }
+    if let Some(due_date) = body.due_date
+        && due_date != row.due_date
+    {
+        sqlx::query("UPDATE tickets SET due_date = ? WHERE id = ?")
+            .bind(due_date)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        log_activity(
+            &mut tx,
+            id,
+            actor,
+            "updated",
+            Some("due_date"),
+            row.due_date.map(iso_date),
+            due_date.map(iso_date),
+        )
+        .await?;
+        changed = true;
     }
 
     // Type and parent are validated together: each constrains the other.

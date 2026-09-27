@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api } from '../lib/api'
-  import { capitalize } from '../lib/format'
+  import { capitalize, dateInputToMs, dateInputValue } from '../lib/format'
   import { router } from '../lib/router.svelte'
   import { app } from '../lib/store.svelte'
   import { toasts } from '../lib/toast.svelte'
@@ -22,6 +22,7 @@
   let assignee = $state<number | null>(null)
   let parent = $state<TicketSummary | null>(null)
   let labels = $state<number[]>([])
+  let dueDate = $state<number | null>(null)
   let another = $state(false)
   let saving = $state(false)
 
@@ -63,11 +64,13 @@
         assignee_id: assignee,
         parent: parentAllowed ? (parent?.key ?? null) : null,
         label_ids: labels,
+        due_date: dueDate,
       })
       toasts.show(`Created ${t.key}`, 'success')
       if (another) {
         title = ''
         description = ''
+        dueDate = null
       } else {
         onclose()
         router.openTicket(t.key)
@@ -136,6 +139,15 @@
         <span class="field-label">Labels</span>
         <LabelPicker value={labels} onchange={(ids) => (labels = ids)} />
       </div>
+      <label>
+        <span class="field-label">Due date</span>
+        <input
+          type="date"
+          class="input"
+          value={dateInputValue(dueDate)}
+          onchange={(e) => (dueDate = dateInputToMs(e.currentTarget.value))}
+        />
+      </label>
     </div>
 
     {#if parentAllowed}

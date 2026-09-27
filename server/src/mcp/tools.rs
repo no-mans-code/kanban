@@ -68,6 +68,7 @@ pub fn definitions() -> Value {
                     "parent": { "type": "string", "description": "Only children of this ticket key" },
                     "blocked": { "type": "boolean", "description": "true: only tickets waiting on an unfinished blocker; false: only unblocked ones" },
                     "include_done": { "type": "boolean", "description": "Include tickets in done statuses (default true)" },
+                    "overdue": { "type": "boolean", "description": "true: only tickets with a past due date that aren't done" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 200, "description": "Default 50" },
                 },
             },
@@ -115,6 +116,7 @@ pub fn definitions() -> Value {
                     "assignee": { "type": "string", "description": "Username or \"me\"" },
                     "parent": { "type": "string", "description": "Parent ticket key" },
                     "labels": { "type": "array", "items": { "type": "string" }, "description": "Label names; missing labels are created" },
+                    "due_date": { "type": "string", "description": "YYYY-MM-DD" },
                 },
                 "required": ["project", "title"],
             },
@@ -137,6 +139,7 @@ pub fn definitions() -> Value {
                     "labels": { "type": "array", "items": { "type": "string" }, "description": "Replace all labels" },
                     "add_labels": { "type": "array", "items": { "type": "string" } },
                     "remove_labels": { "type": "array", "items": { "type": "string" } },
+                    "due_date": { "type": "string", "description": "YYYY-MM-DD, or null to clear it" },
                 },
                 "required": ["key"],
             },
@@ -214,24 +217,19 @@ fn names(args: &Map<String, Value>, name: &str) -> Option<Vec<String>> {
     args.get(name)?.as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
 }
 
+fn due_date_ms(s: &str) -> Result<i64, String> {
+    crate::models::parse_iso_date(s.trim())
+        .ok_or_else(|| format!("`{s}` is not a valid date; use YYYY-MM-DD"))
+}
+
 fn limit(args: &Map<String, Value>, default: usize) -> usize {
     args.get("limit").and_then(Value::as_u64).map(|n| n.clamp(1, 200) as usize).unwrap_or(default)
 }
 
 /// Unix milliseconds to an ISO 8601 UTC timestamp.
 fn iso(ms: i64) -> String {
-    let secs = ms.div_euclid(1000);
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    // Civil-from-days, from Howard Hinnant's date algorithms.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + i64::from(m <= 2);
+    let rem = ms.div_euclid(1000).rem_euclid(86_400);
+    let (y, m, d) = crate::models::civil_date(ms);
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
@@ -266,6 +264,7 @@ impl Names {
             "blocked": t["is_blocked"],
             "children": t["child_count"],
             "comments": t["comment_count"],
+            "due_date": t["due_date"].as_i64().map(crate::models::iso_date),
             "updated_at": t["updated_at"].as_i64().map(iso),
         })
     }
@@ -420,6 +419,9 @@ impl Ctx {
                 query.push(format!("{param}={}", enc(v)));
             }
         }
+        if args.get("overdue").and_then(Value::as_bool) == Some(true) {
+            query.push("overdue=true".to_string());
+        }
         if let Some(who) = text(args, "assignee") {
             let id = self.user_id(who).await?;
             query.push(format!("assignee={}", id.map_or("none".into(), |i| i.to_string())));
@@ -553,6 +555,9 @@ impl Ctx {
         if let Some(labels) = names(args, "labels") {
             b.insert("label_ids".into(), json!(self.label_ids(&labels).await?));
         }
+        if let Some(d) = text(args, "due_date") {
+            b.insert("due_date".into(), json!(due_date_ms(d)?));
+        }
         let created = self.request(Method::POST, "/api/tickets", Some(body)).await?;
         Ok(self.names().await?.brief(&created))
     }
@@ -612,6 +617,18 @@ impl Ctx {
             ids.sort_unstable();
             ids.dedup();
             patch.insert("label_ids".into(), json!(ids));
+        }
+        match args.get("due_date") {
+            Some(Value::Null) => {
+                patch.insert("due_date".into(), Value::Null);
+            }
+            Some(Value::String(d)) if d.eq_ignore_ascii_case("none") || d.trim().is_empty() => {
+                patch.insert("due_date".into(), Value::Null);
+            }
+            Some(Value::String(d)) => {
+                patch.insert("due_date".into(), json!(due_date_ms(d)?));
+            }
+            _ => {}
         }
         if patch.is_empty() {
             return Err("Nothing to change: pass at least one field to update".into());

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { api } from '../lib/api'
   import { filters } from '../lib/filters.svelte'
-  import { relativeTime } from '../lib/format'
+  import { isOverdue, relativeTime, shortDate } from '../lib/format'
   import { router } from '../lib/router.svelte'
   import { app } from '../lib/store.svelte'
   import { toasts } from '../lib/toast.svelte'
@@ -14,7 +14,7 @@
 
   let { project }: { project: ProjectDetail } = $props()
 
-  type SortKey = 'key' | 'type' | 'title' | 'status' | 'assignee' | 'priority' | 'updated'
+  type SortKey = 'key' | 'type' | 'title' | 'status' | 'assignee' | 'priority' | 'due' | 'updated'
   let tickets = $state<TicketSummary[]>([])
   let sortKey = $state<SortKey>('key')
   let desc = $state(false)
@@ -43,6 +43,8 @@
         return t.assignee_id === null ? '~' : (app.usersById.get(t.assignee_id)?.display_name.toLowerCase() ?? '')
       case 'priority':
         return PRIORITIES.indexOf(t.priority)
+      case 'due':
+        return t.due_date ?? Infinity
       case 'updated':
         return -t.updated_at
     }
@@ -86,6 +88,7 @@
     ['status', 'Status'],
     ['assignee', 'Assignee'],
     ['priority', 'Priority'],
+    ['due', 'Due'],
     ['updated', 'Updated'],
   ]
 </script>
@@ -133,6 +136,9 @@
             </span>
           </td>
           <td class="priority"><span class="who"><PriorityIcon priority={t.priority} />{t.priority}</span></td>
+          <td class="due" class:overdue={isOverdue(t.due_date, t.status_category)}>
+            {t.due_date === null ? '' : shortDate(t.due_date)}
+          </td>
           <td class="updated muted">{relativeTime(t.updated_at)}</td>
           <td>
             <div class="label-list">
@@ -241,6 +247,14 @@
   }
   td.priority .who {
     text-transform: capitalize;
+  }
+  td.due {
+    color: var(--text-2);
+    white-space: nowrap;
+  }
+  td.due.overdue {
+    color: var(--danger);
+    font-weight: 500;
   }
   .status-select {
     height: 24px;

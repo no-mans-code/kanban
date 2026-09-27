@@ -76,6 +76,14 @@
     <option value={null}>All labels</option>
     {#each app.labels as l (l.id)}<option value={l.id}>{l.name}</option>{/each}
   </select>
+  <button
+    class="btn btn-ghost btn-sm overdue-toggle"
+    class:on={filters.overdue}
+    onclick={() => (filters.overdue = !filters.overdue)}
+    aria-pressed={filters.overdue}
+  >
+    <Icon name="calendar" size={13} /> Overdue
+  </button>
 
   {#if filters.active}
     <button class="btn btn-ghost btn-sm" onclick={() => filters.clear()}>Clear</button>
@@ -144,5 +152,15 @@
   .count {
     font-size: 12px;
     color: var(--text-3);
+  }
+  .overdue-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  .overdue-toggle.on {
+    border-color: var(--danger);
+    color: var(--danger);
+    background: var(--danger-soft);
   }
 </style>

@@ -1,3 +1,4 @@
+import { isOverdue } from './format'
 import type { TicketSummary } from './types'
 
 class Filters {
@@ -7,6 +8,7 @@ class Filters {
   type = $state('')
   priority = $state('')
   label = $state<number | null>(null)
+  overdue = $state(false)
   /** Keys the server's full-text search matched (descriptions, comments). */
   serverHits = $state<Set<string> | null>(null)
 
@@ -15,13 +17,15 @@ class Filters {
       this.assignees.length > 0 ||
       this.type !== '' ||
       this.priority !== '' ||
-      this.label !== null,
+      this.label !== null ||
+      this.overdue,
   )
 
   matches(t: TicketSummary): boolean {
     if (this.type && t.type !== this.type) return false
     if (this.priority && t.priority !== this.priority) return false
     if (this.label !== null && !t.label_ids.includes(this.label)) return false
+    if (this.overdue && !isOverdue(t.due_date, t.status_category)) return false
     if (this.assignees.length > 0) {
       const who = t.assignee_id ?? 'none'
       if (!this.assignees.includes(who)) return false
@@ -46,6 +50,7 @@ class Filters {
     this.type = ''
     this.priority = ''
     this.label = null
+    this.overdue = false
     this.serverHits = null
   }
 }

@@ -147,6 +147,7 @@ pub struct TicketSummary {
     pub created_at: i64,
     pub updated_at: i64,
     pub resolved_at: Option<i64>,
+    pub due_date: Option<i64>,
     #[serde(serialize_with = "id_list")]
     pub label_ids: String,
     pub child_count: i64,
@@ -164,7 +165,7 @@ SELECT t.id,
        t.priority, t.assignee_id, t.reporter_id, t.parent_id,
        (SELECT pp.key || '-' || pt.number FROM tickets pt JOIN projects pp ON pp.id = pt.project_id
          WHERE pt.id = t.parent_id) AS parent_key,
-       t.rank, t.created_at, t.updated_at, t.resolved_at,
+       t.rank, t.created_at, t.updated_at, t.resolved_at, t.due_date,
        COALESCE((SELECT group_concat(tl.label_id) FROM ticket_labels tl WHERE tl.ticket_id = t.id), '')
          AS label_ids,
        (SELECT count(*) FROM tickets c WHERE c.parent_id = t.id) AS child_count,
@@ -297,6 +298,48 @@ pub async fn reindex(conn: &mut SqliteConnection, ticket_id: i64) -> ApiResult<(
     Ok(())
 }
 
+/// Civil calendar date (year, month, day) for a unix-ms UTC timestamp, via
+/// Howard Hinnant's date algorithms.
+pub fn civil_date(ms: i64) -> (i64, u32, u32) {
+    let secs = ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m as u32, d as u32)
+}
+
+/// `YYYY-MM-DD` for a unix-ms UTC timestamp, for display (e.g. a due date).
+pub fn iso_date(ms: i64) -> String {
+    let (y, m, d) = civil_date(ms);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Epoch milliseconds at UTC midnight for a `YYYY-MM-DD` date, or `None` if
+/// it doesn't parse. Inverse of `civil_date` (Howard Hinnant's algorithms).
+pub fn parse_iso_date(s: &str) -> Option<i64> {
+    let (y, rest) = s.split_once('-')?;
+    let (m, d) = rest.split_once('-')?;
+    let (y, m, d): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400_000)
+}
+
 pub async fn watch(conn: &mut SqliteConnection, ticket_id: i64, user: Option<i64>) -> ApiResult<()> {
     if let Some(user) = user {
         sqlx::query("INSERT OR IGNORE INTO ticket_watchers (ticket_id, user_id) VALUES (?, ?)")
@@ -306,4 +349,31 @@ pub async fn watch(conn: &mut SqliteConnection, ticket_id: i64, user: Option<i64
             .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iso_date_matches_known_days() {
+        assert_eq!(iso_date(0), "1970-01-01");
+        assert_eq!(iso_date(951_782_400_000), "2000-02-29"); // a leap day
+        assert_eq!(iso_date(4_102_444_800_000), "2100-01-01");
+    }
+
+    #[test]
+    fn parse_iso_date_round_trips_through_civil_date() {
+        for s in ["1970-01-01", "2000-02-29", "2026-09-27", "2100-01-01", "1999-12-31"] {
+            let ms = parse_iso_date(s).unwrap();
+            assert_eq!(iso_date(ms), s, "round trip for {s}");
+        }
+    }
+
+    #[test]
+    fn parse_iso_date_rejects_garbage() {
+        for s in ["", "not-a-date", "2026-13-01", "2026-01-40", "2026/09/27"] {
+            assert!(parse_iso_date(s).is_none(), "{s} should not parse");
+        }
+    }
 }

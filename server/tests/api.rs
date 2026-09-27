@@ -280,6 +280,42 @@ async fn edits_are_recorded_in_history() {
 }
 
 #[tokio::test]
+async fn due_dates_are_settable_sortable_and_filter_overdue() {
+    let t = TestApp::new().await;
+    t.setup().await;
+    let past = t.ticket("Past due", json!({ "due_date": 0 })).await; // 1970-01-01
+    let future = t.ticket("Not due yet", json!({ "due_date": 4_102_444_800_000_i64 })).await; // 2100-01-01
+    let none = t.ticket("No due date", json!({})).await;
+
+    let detail = t.get(&format!("/api/tickets/{past}")).await;
+    assert_eq!(detail["due_date"], 0);
+    let detail = t.get(&format!("/api/tickets/{none}")).await;
+    assert_eq!(detail["due_date"], Value::Null);
+
+    // Sorting puts due dates in order with nulls last.
+    let sorted = t.get("/api/tickets?sort=due").await;
+    let keys: Vec<&str> = sorted.as_array().unwrap().iter().map(|x| x["key"].as_str().unwrap()).collect();
+    assert_eq!(keys, [past.as_str(), future.as_str(), none.as_str()]);
+
+    // Only the not-done, past-due ticket is "overdue".
+    let overdue = t.get("/api/tickets?overdue=true").await;
+    let keys: Vec<&str> = overdue.as_array().unwrap().iter().map(|x| x["key"].as_str().unwrap()).collect();
+    assert_eq!(keys, [past.as_str()]);
+
+    // The activity log records the change with a readable date, not raw ms.
+    t.ok(Method::PATCH, &format!("/api/tickets/{future}"), json!({ "due_date": 0 })).await;
+    let history = t.get(&format!("/api/tickets/{future}/activity")).await;
+    let due = history.as_array().unwrap().iter().find(|a| a["field"] == "due_date").unwrap();
+    assert_eq!(due["old_value"], "2100-01-01");
+    assert_eq!(due["new_value"], "1970-01-01");
+
+    // Clearing it back to null works, and is distinct from "not provided".
+    t.ok(Method::PATCH, &format!("/api/tickets/{future}"), json!({ "due_date": null })).await;
+    let detail = t.get(&format!("/api/tickets/{future}")).await;
+    assert_eq!(detail["due_date"], Value::Null);
+}
+
+#[tokio::test]
 async fn deleting_a_status_in_use_needs_a_destination() {
     let t = TestApp::new().await;
     let project = t.setup().await;

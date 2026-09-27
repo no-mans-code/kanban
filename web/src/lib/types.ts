@@ -131,6 +131,7 @@ export interface TicketSummary {
   created_at: number
   updated_at: number
   resolved_at: number | null
+  due_date: number | null
   label_ids: number[]
   child_count: number
   done_child_count: number

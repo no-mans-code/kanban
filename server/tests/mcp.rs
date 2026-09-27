@@ -229,6 +229,30 @@ async fn an_agent_can_run_a_whole_workflow() {
     assert!(err && missing.as_str().unwrap().contains("not found"));
 }
 
+#[tokio::test]
+async fn due_dates_round_trip_as_plain_calendar_dates() {
+    let m = Mcp::new().await;
+    let (err, created) = m
+        .tool("create_ticket", json!({ "project": "KAN", "title": "Ship it", "due_date": "2026-12-31" }))
+        .await;
+    assert!(!err, "{created}");
+    assert_eq!(created["due_date"], "2026-12-31");
+
+    let (err, bad) = m
+        .tool("create_ticket", json!({ "project": "KAN", "title": "Bad date", "due_date": "31/12/2026" }))
+        .await;
+    assert!(err, "should reject a non-ISO date");
+    assert!(bad.as_str().unwrap().contains("YYYY-MM-DD"), "{bad}");
+
+    let (err, overdue) = m.tool("search_tickets", json!({ "project": "KAN", "overdue": true })).await;
+    assert!(!err);
+    assert_eq!(overdue["total"], 0, "a 2026-12-31 due date from this test's run isn't overdue yet");
+
+    let (err, cleared) = m.tool("update_ticket", json!({ "key": "KAN-1", "due_date": null })).await;
+    assert!(!err, "{cleared}");
+    assert_eq!(cleared["due_date"], Value::Null);
+}
+
 /// The core promise this session's auth work is for: a token narrowed to
 /// one project can use MCP to see and work that project, but a project it
 /// isn't a member of simply doesn't exist to it — not a 403, a 404, exactly

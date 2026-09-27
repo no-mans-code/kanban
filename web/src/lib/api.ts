@@ -97,7 +97,8 @@ export interface TicketQuery {
   parent?: string
   watcher?: number
   q?: string
-  sort?: 'rank' | 'updated' | 'created' | 'priority' | 'key'
+  overdue?: boolean
+  sort?: 'rank' | 'updated' | 'created' | 'priority' | 'due' | 'key'
   limit?: number
   offset?: number
 }
@@ -112,6 +113,7 @@ export interface TicketInput {
   assignee_id?: number | null
   parent?: string | null
   label_ids?: number[]
+  due_date?: number | null
 }
 
 export type TicketPatch = Partial<{
@@ -123,6 +125,7 @@ export type TicketPatch = Partial<{
   assignee_id: number | null
   parent: string | null
   label_ids: number[]
+  due_date: number | null
 }>
 
 export interface CreateTokenInput {

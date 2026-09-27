@@ -1,9 +1,9 @@
 # Kanban
 
 A local, Jira-style Kanban board: tickets, sub-tickets, comments, assignees,
-watchers, labels, full history, and a **dependency DAG** with cycle
-prevention and an optional maximum chain height. It is one Rust binary with
-the web UI embedded in it, backed by a single SQLite file.
+watchers, labels, due dates, full history, and a **dependency DAG** with
+cycle prevention and an optional maximum chain height. It is one Rust binary
+with the web UI embedded in it, backed by a single SQLite file.
 
 - **Backend:** Rust (axum, tokio, sqlx) + SQLite (WAL, FTS5 full-text search)
 - **Frontend:** Svelte 5 + TypeScript + Vite; Svelte Flow + ELK for the DAG view
@@ -471,7 +471,7 @@ suites don't cover the UI. Development with hot reload uses two terminals:
 ### Not built yet (Phase 2)
 
 Sprints and backlog planning, work-in-progress limits per column, attachments,
-due dates and time tracking, components and versions, a JQL-like query
+time tracking, components and versions, a JQL-like query
 language, bulk edit, saved filters, @mentions and notifications, webhooks,
 custom fields, workflow transition rules, swimlanes, reports (burndown,
 cumulative flow), password reset / email verification, an audit log UI for

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { isOverdue, shortDate } from '../lib/format'
   import { app } from '../lib/store.svelte'
   import type { TicketSummary } from '../lib/types'
   import Avatar from './Avatar.svelte'
@@ -43,10 +44,16 @@
 >
   <div class="title">{ticket.title}</div>
 
-  {#if labels.length || ticket.parent_key || ticket.is_blocked}
+  {#if labels.length || ticket.parent_key || ticket.is_blocked || ticket.due_date !== null}
     <div class="tags">
       {#if ticket.is_blocked}
         <span class="chip blocked" title="Waiting on a ticket that isn't done"><Icon name="lock" size={11} /> Blocked</span>
+      {/if}
+      {#if ticket.due_date !== null}
+        {@const overdue = isOverdue(ticket.due_date, ticket.status_category)}
+        <span class="chip" class:overdue title={overdue ? 'Overdue' : 'Due date'}>
+          <Icon name="calendar" size={11} />{shortDate(ticket.due_date)}
+        </span>
       {/if}
       {#if ticket.parent_key}
         <span class="chip" title="Parent"><Icon name="layers" size={11} />{ticket.parent_key}</span>
@@ -115,7 +122,8 @@
     flex-wrap: wrap;
     gap: 4px;
   }
-  .blocked {
+  .blocked,
+  .chip.overdue {
     background: var(--danger-soft);
     color: var(--danger);
   }

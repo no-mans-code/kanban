@@ -1,7 +1,7 @@
 <script lang="ts">
   import { untrack } from 'svelte'
   import { api, type TicketPatch } from '../lib/api'
-  import { capitalize, fullTime, relativeTime } from '../lib/format'
+  import { capitalize, dateInputToMs, dateInputValue, fullTime, isOverdue, relativeTime } from '../lib/format'
   import { projectUrl, router } from '../lib/router.svelte'
   import { app } from '../lib/store.svelte'
   import { toasts } from '../lib/toast.svelte'
@@ -345,6 +345,23 @@
           </div>
         </div>
 
+        <div class="field">
+          <span class="field-label">Due date</span>
+          <div class="with-icon">
+            <input
+              type="date"
+              class="bare due-input"
+              class:overdue={isOverdue(detail.due_date, detail.status_category)}
+              value={dateInputValue(detail.due_date)}
+              onchange={(e) => patch({ due_date: dateInputToMs(e.currentTarget.value) })}
+              aria-label="Due date"
+            />
+            {#if detail.due_date !== null}
+              <button class="icon-btn tiny" title="Clear due date" onclick={() => patch({ due_date: null })}><Icon name="x" size={13} /></button>
+            {/if}
+          </div>
+        </div>
+
         {#if detail.type !== 'epic'}
           <div class="field">
             <span class="field-label">Parent</span>
@@ -592,6 +609,18 @@
     gap: 8px;
     min-height: 30px;
     font-size: 13px;
+  }
+  .due-input {
+    border-radius: var(--radius-sm);
+    color: var(--text);
+    font-size: 13px;
+    color-scheme: dark;
+  }
+  :global(:root[data-theme='light']) .due-input {
+    color-scheme: light;
+  }
+  .due-input.overdue {
+    color: var(--danger);
   }
   .status {
     height: 30px;
