@@ -30,6 +30,12 @@ pub struct CreateLabel {
     color: Option<String>,
 }
 
+/// Deliberately open to any writable caller, unlike update/delete: an
+/// ordinary project member (or their agent token) tagging a ticket with a
+/// label that doesn't exist yet is expected to just create it — the MCP
+/// create_ticket/update_ticket tools rely on exactly this. Adding a new
+/// label has no blast radius on other projects; renaming or removing an
+/// existing one does, which is why those two require a site admin.
 pub async fn create(
     State(state): State<AppState>,
     Auth(p): Auth,
@@ -66,7 +72,11 @@ pub async fn update(
     Path(id): Path<i64>,
     Json(body): Json<UpdateLabel>,
 ) -> ApiResult<Json<Label>> {
-    p.require_writable()?;
+    // Labels aren't scoped to a project (see the table's schema) — renaming
+    // or recoloring one affects every ticket on the board that uses it,
+    // including in projects this caller may not even be able to see. That
+    // needs the same bar as creating a project: a site admin.
+    p.require_site_admin()?;
     let mut tx = write_tx(&state.db).await?;
     if let Some(name) = body.name {
         sqlx::query("UPDATE labels SET name = ? WHERE id = ?")
@@ -97,7 +107,9 @@ pub async fn delete(
     Auth(p): Auth,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
-    p.require_writable()?;
+    // Same reasoning as update(): deleting a shared label untags it from
+    // every ticket that has it, board-wide.
+    p.require_site_admin()?;
     let mut tx = write_tx(&state.db).await?;
     let deleted = sqlx::query("DELETE FROM labels WHERE id = ?").bind(id).execute(&mut *tx).await?;
     if deleted.rows_affected() == 0 {

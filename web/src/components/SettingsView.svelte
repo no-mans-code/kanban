@@ -280,12 +280,17 @@
     {:else if tab === 'labels'}
       <h2>Labels</h2>
       <p class="lead">Shared by every project.</p>
+      {#if !app.isSiteAdmin}
+        <p class="muted">Anyone can add a label; only a site administrator can rename, recolor or delete one, since it can be in use on a project you can't see.</p>
+      {/if}
       <div class="rows">
         {#each app.labels as l (l.id)}
           <div class="row">
-            <input type="color" class="swatch" value={l.color} onchange={(e) => labelCall(() => api.updateLabel(l.id, { color: e.currentTarget.value }))} aria-label="Color" />
-            <input class="input grow" value={l.name} onchange={(e) => labelCall(() => api.updateLabel(l.id, { name: e.currentTarget.value }))} aria-label="Label name" />
-            <button class="icon-btn" title="Delete" onclick={() => deleteLabel(l)}><Icon name="trash" size={14} /></button>
+            <input type="color" class="swatch" value={l.color} disabled={!app.isSiteAdmin} onchange={(e) => labelCall(() => api.updateLabel(l.id, { color: e.currentTarget.value }))} aria-label="Color" />
+            <input class="input grow" value={l.name} disabled={!app.isSiteAdmin} onchange={(e) => labelCall(() => api.updateLabel(l.id, { name: e.currentTarget.value }))} aria-label="Label name" />
+            {#if app.isSiteAdmin}
+              <button class="icon-btn" title="Delete" onclick={() => deleteLabel(l)}><Icon name="trash" size={14} /></button>
+            {/if}
           </div>
         {/each}
         <div class="row add">

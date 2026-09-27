@@ -324,6 +324,34 @@ async fn roles_gate_write_and_admin_actions() {
     let (status, _, err) =
         t.raw("PATCH", "/api/settings", Some(&ids["admin-bot"]), Some(json!({ "max_dag_height": 5 }))).await;
     assert_eq!(status, 403, "{err}");
+
+    // Labels aren't scoped to a project (they're shared board-wide), so any
+    // writer may create one (the MCP create_ticket tool relies on this to
+    // tag a ticket with a label that doesn't exist yet), but changing or
+    // removing an existing one needs a site admin — a project admin isn't
+    // enough, since the label could be in use on a project they can't see.
+    let (status, _, label) =
+        t.raw("POST", "/api/labels", Some(&ids["work-bot"]), Some(json!({ "name": "shared-label" }))).await;
+    assert_eq!(status, 201, "{label}");
+    let label_id = label["id"].as_i64().unwrap();
+    let (status, _, err) = t
+        .raw(
+            "PATCH",
+            &format!("/api/labels/{label_id}"),
+            Some(&ids["admin-bot"]),
+            Some(json!({ "name": "x" })),
+        )
+        .await;
+    assert_eq!(status, 403, "a project admin isn't a site admin: {err}");
+    let (status, _, err) =
+        t.raw("DELETE", &format!("/api/labels/{label_id}"), Some(&ids["admin-bot"]), None).await;
+    assert_eq!(status, 403, "{err}");
+    let (status, _, err) = t
+        .raw("PATCH", &format!("/api/labels/{label_id}"), Some(&admin), Some(json!({ "name": "renamed" })))
+        .await;
+    assert_eq!(status, 200, "a site admin can: {err}");
+    let (status, _, err) = t.raw("DELETE", &format!("/api/labels/{label_id}"), Some(&admin), None).await;
+    assert_eq!(status, 204, "{err}");
 }
 
 #[tokio::test]
