@@ -132,6 +132,13 @@
     return above.length ? above[above.length - 1].key : null
   }
 
+  /** `newTitle` is shared by every column's quick-add box; switching
+   * columns without submitting must not carry a draft into the wrong one. */
+  function startAdding(statusId: number) {
+    if (adding !== statusId) newTitle = ''
+    adding = statusId
+  }
+
   async function quickAdd(status: Status) {
     const title = newTitle.trim()
     if (!title) return
@@ -162,7 +169,7 @@
           {items.length === total ? total : `${items.length}/${total}`}{status.wip_limit !== null ? ` / ${status.wip_limit}` : ''}
         </span>
         <span class="spacer"></span>
-        <button class="icon-btn" title="Add a ticket to {status.name}" onclick={() => (adding = status.id)}>
+        <button class="icon-btn" title="Add a ticket to {status.name}" onclick={() => startAdding(status.id)}>
           <Icon name="plus" size={15} />
         </button>
       </header>
@@ -205,7 +212,7 @@
             }}
           />
         {:else if loaded && items.length === 0 && !drop}
-          <button class="empty" onclick={() => (adding = status.id)}>
+          <button class="empty" onclick={() => startAdding(status.id)}>
             <Icon name="plus" size={14} /> Add ticket
           </button>
         {/if}
