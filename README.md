@@ -177,7 +177,8 @@ kanban/
     src/models.rs                   row structs, SUMMARY_SELECT (the one ticket-summary query), shared helpers
                                     (resolve_key, summaries, log_activity, reindex, watch, valid_parent, validation)
     src/api/mod.rs                  route table, `Actor` extractor (X-Actor header), /api/health, /api/events (SSE)
-    src/api/tickets.rs              list/search/filter, detail, create, update (PATCH), move (drag and drop), delete, watchers, activity
+    src/api/tickets.rs              list/search/filter, detail, create, update (PATCH), move (drag and drop), watchers, activity
+    src/api/deletion.rs             delete plan (preview) and deletion with explicit decisions for children and dependents
     src/api/comments.rs             comment CRUD
     src/api/links.rs                link create/delete with DAG checks; /api/graph for the DAG view
     src/api/settings.rs             max_dag_height get/set; blocks_edges() and max_height() helpers
@@ -240,7 +241,7 @@ updates one row. When the gap falls below 1e-6, that column is renumbered
 Send `X-Actor: <user id>` on writes to attribute them. Errors look like
 `{"error": {"code": "...", "message": "...", "detail": ...}}`. Codes:
 `invalid` (400), `not_found` (404), `duplicate`, `cycle`, `height_exceeded`,
-`status_in_use`, `last_status` (409), `internal` (500). For `cycle` and
+`status_in_use`, `last_status`, `decision_required` (409), `internal` (500). For `cycle` and
 `height_exceeded`, `detail.chain` lists the ticket keys involved.
 
 | Method & path | Purpose |
@@ -258,7 +259,8 @@ Send `X-Actor: <user id>` on writes to attribute them. Errors look like
 | `GET /tickets/{key}` | Summary + `description`, `watcher_ids`, `children`, `links` |
 | `PATCH /tickets/{key}` | Any of `title, description, type, priority, status_id, assignee_id (null to clear), parent (key or null), label_ids` |
 | `POST /tickets/{key}/move` | `{status_id, after: key or null}`; drag-and-drop placement |
-| `DELETE /tickets/{key}` | Also deletes its subtasks; an epic's children are only detached |
+| `GET /tickets/{key}/delete-plan` | Everything a deletion would touch: children, grandchildren, parent, blockers, dependents (with `becomes_ready_if_dropped`), other links, and the valid `children_options` / `dependents_options` |
+| `DELETE /tickets/{key}?children=&dependents=&move_to=&transfer_to=` | Deletes, applying explicit decisions. `children`: `delete` · `detach` (subtasks become tasks) · `move` (+`move_to`) · `promote` (subtasks become tasks in the grandparent epic). `dependents`: `drop` · `bridge` (its blockers now block them) · `children` · `transfer` (+`transfer_to`). A decision is **required** whenever that group is non-empty (else `409 decision_required` with the plan). New links pass the cycle/height checks or nothing is deleted |
 | `GET /tickets/{key}/activity` | History |
 | `POST /tickets/{key}/watchers`, `DELETE /tickets/{key}/watchers/{user_id}` | Watchers |
 | `GET/POST /tickets/{key}/comments`, `PATCH/DELETE /comments/{id}` | Comments |

@@ -160,7 +160,7 @@ async fn hierarchy_follows_jira_rules() {
     // Detach, then deleting the story takes its subtask with it.
     t.ok(Method::PATCH, &format!("/api/tickets/{story}"), json!({ "parent": null })).await;
     assert_eq!(t.get(&format!("/api/tickets/{story}")).await["parent_key"], Value::Null);
-    assert_eq!(t.req(Method::DELETE, &format!("/api/tickets/{story}"), None).await.0, 204);
+    assert_eq!(t.req(Method::DELETE, &format!("/api/tickets/{story}?children=delete"), None).await.0, 204);
     assert_eq!(t.req(Method::GET, &format!("/api/tickets/{sub}"), None).await.0, 404);
 }
 
@@ -381,12 +381,12 @@ async fn deletion_is_recorded_on_every_ticket_it_touches() {
     assert_eq!(t.link(&blocker, &blocked).await.0, 201);
     assert_eq!(t.get(&format!("/api/tickets/{blocked}")).await["is_blocked"], true);
 
-    assert_eq!(t.req(Method::DELETE, &format!("/api/tickets/{epic}"), None).await.0, 204);
+    assert_eq!(t.req(Method::DELETE, &format!("/api/tickets/{epic}?children=detach"), None).await.0, 204);
     let last = last_activity(&t, &story).await;
     assert_eq!((last["field"].as_str(), last["old_value"].as_str()), (Some("parent"), Some(epic.as_str())));
     assert_eq!(last["new_value"], format!("None ({epic} deleted)"));
 
-    assert_eq!(t.req(Method::DELETE, &format!("/api/tickets/{blocker}"), None).await.0, 204);
+    assert_eq!(t.req(Method::DELETE, &format!("/api/tickets/{blocker}?dependents=drop"), None).await.0, 204);
     let last = last_activity(&t, &blocked).await;
     assert_eq!(last["action"], "unlinked");
     assert_eq!(last["field"], "is blocked by");
@@ -397,4 +397,137 @@ async fn deletion_is_recorded_on_every_ticket_it_touches() {
     let last = last_activity(&t, &story).await;
     assert_eq!(last["action"], "child_deleted");
     assert_eq!(last["old_value"], format!("{sub}: Sub"));
+}
+
+async fn detail(t: &TestApp, key: &str) -> Value {
+    t.get(&format!("/api/tickets/{key}")).await
+}
+
+async fn blockers_of(t: &TestApp, key: &str) -> Vec<String> {
+    let d = detail(t, key).await;
+    let mut keys: Vec<String> = d["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["label"] == "is blocked by")
+        .map(|l| l["ticket"]["key"].as_str().unwrap().to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+#[tokio::test]
+async fn deleting_requires_decisions_and_promote_bridge_rewire_the_work() {
+    let t = TestApp::new().await;
+    t.setup().await;
+    let epic = t.ticket("Epic", json!({ "type": "epic" })).await;
+    let story = t.ticket("Story", json!({ "type": "story", "parent": epic })).await;
+    let sub1 = t.ticket("Sub 1", json!({ "type": "subtask", "parent": story })).await;
+    let sub2 = t.ticket("Sub 2", json!({ "type": "subtask", "parent": story })).await;
+    let before = t.ticket("Must happen first", json!({})).await;
+    let after = t.ticket("Waits for the story", json!({})).await;
+    assert_eq!(t.link(&before, &story).await.0, 201);
+    assert_eq!(t.link(&story, &after).await.0, 201);
+
+    // No decisions: refused, and the answer is the plan.
+    let (status, err) = t.req(Method::DELETE, &format!("/api/tickets/{story}"), None).await;
+    assert_eq!(status, 409);
+    assert_eq!(err["error"]["code"], "decision_required");
+    let plan = &err["error"]["detail"];
+    assert_eq!(plan["children"].as_array().unwrap().len(), 2);
+    assert_eq!(plan["parent"]["key"], epic);
+    assert_eq!(plan["blockers"][0]["key"], before);
+    assert_eq!(plan["dependents"][0]["key"], after);
+    assert_eq!(plan["dependents"][0]["becomes_ready_if_dropped"], true, "only the story blocks it");
+    assert_eq!(plan["children_options"], json!(["delete", "detach", "move", "promote"]));
+    assert_eq!(plan["dependents_options"], json!(["drop", "bridge", "children", "transfer"]));
+    assert_eq!(
+        t.get(&format!("/api/tickets/{story}/delete-plan")).await,
+        *plan,
+        "the preview is the same plan"
+    );
+
+    // Only one of the two decisions: still refused.
+    let (status, _) = t.req(Method::DELETE, &format!("/api/tickets/{story}?children=promote"), None).await;
+    assert_eq!(status, 409);
+
+    let uri = format!("/api/tickets/{story}?children=promote&dependents=bridge");
+    assert_eq!(t.req(Method::DELETE, &uri, None).await.0, 204);
+    for sub in [&sub1, &sub2] {
+        let d = detail(&t, sub).await;
+        assert_eq!((d["type"].as_str(), d["parent_key"].as_str()), (Some("task"), Some(epic.as_str())));
+    }
+    assert_eq!(blockers_of(&t, &after).await, vec![before.clone()], "A→X→B became A→B");
+    assert_eq!(detail(&t, &after).await["is_blocked"], true);
+    let history = t.get(&format!("/api/tickets/{sub1}/activity")).await;
+    let fields: Vec<&str> = history.as_array().unwrap().iter().filter_map(|a| a["field"].as_str()).collect();
+    assert!(fields.contains(&"type") && fields.contains(&"parent"), "{fields:?}");
+}
+
+#[tokio::test]
+async fn detach_move_children_and_transfer_strategies() {
+    let t = TestApp::new().await;
+    t.setup().await;
+    // detach + dependents=children: the dependent now waits for the former subtask.
+    let story = t.ticket("Story", json!({ "type": "story" })).await;
+    let sub = t.ticket("Sub", json!({ "type": "subtask", "parent": story })).await;
+    let waiting = t.ticket("Waiting", json!({})).await;
+    assert_eq!(t.link(&story, &waiting).await.0, 201);
+    let uri = format!("/api/tickets/{story}?children=detach&dependents=children");
+    assert_eq!(t.req(Method::DELETE, &uri, None).await.0, 204);
+    let d = detail(&t, &sub).await;
+    assert_eq!((d["type"].as_str(), d["parent_key"].clone()), (Some("task"), Value::Null));
+    assert_eq!(blockers_of(&t, &waiting).await, vec![sub.clone()]);
+
+    // move + transfer to the same replacement story.
+    let old = t.ticket("Old story", json!({ "type": "story" })).await;
+    let child = t.ticket("Child", json!({ "type": "subtask", "parent": old })).await;
+    let replacement = t.ticket("Replacement", json!({ "type": "story" })).await;
+    let epic = t.ticket("Epic", json!({ "type": "epic" })).await;
+    let downstream = t.ticket("Downstream", json!({})).await;
+    assert_eq!(t.link(&old, &downstream).await.0, 201);
+
+    // Invalid choices change nothing.
+    let bad = [
+        format!("/api/tickets/{old}?children=move&move_to={epic}&dependents=drop"),
+        format!("/api/tickets/{old}?children=delete&dependents=children"),
+        format!("/api/tickets/{old}?children=move&dependents=drop"),
+    ];
+    for uri in &bad {
+        assert_eq!(t.req(Method::DELETE, uri, None).await.0, 400, "{uri}");
+    }
+    assert_eq!(detail(&t, &child).await["parent_key"], old);
+
+    let uri = format!(
+        "/api/tickets/{old}?children=move&move_to={replacement}&dependents=transfer&transfer_to={replacement}"
+    );
+    assert_eq!(t.req(Method::DELETE, &uri, None).await.0, 204);
+    assert_eq!(detail(&t, &child).await["parent_key"], replacement);
+    assert_eq!(blockers_of(&t, &downstream).await, vec![replacement.clone()]);
+    assert_eq!(t.req(Method::GET, &format!("/api/tickets/{old}"), None).await.0, 404);
+}
+
+#[tokio::test]
+async fn a_rewire_that_would_create_a_cycle_deletes_nothing() {
+    let t = TestApp::new().await;
+    t.setup().await;
+    let story = t.ticket("Story", json!({ "type": "story" })).await;
+    let sub = t.ticket("Sub", json!({ "type": "subtask", "parent": story })).await;
+    let dependent = t.ticket("Dependent", json!({})).await;
+    assert_eq!(t.link(&story, &dependent).await.0, 201);
+    assert_eq!(t.link(&dependent, &sub).await.0, 201, "the subtask waits for the dependent");
+
+    // Handing the dependent to the subtask would make them wait on each other.
+    let uri = format!("/api/tickets/{story}?children=detach&dependents=children");
+    let (status, err) = t.req(Method::DELETE, &uri, None).await;
+    assert_eq!(status, 409);
+    assert_eq!(err["error"]["code"], "cycle");
+    assert!(err["error"]["message"].as_str().unwrap().starts_with("Nothing was deleted"));
+    let d = detail(&t, &sub).await;
+    assert_eq!((d["type"].as_str(), d["parent_key"].as_str()), (Some("subtask"), Some(story.as_str())));
+    assert_eq!(detail(&t, &story).await["key"], story, "the story still exists");
+
+    // A ticket with nothing attached needs no decisions.
+    let lone = t.ticket("Lone", json!({})).await;
+    assert_eq!(t.req(Method::DELETE, &format!("/api/tickets/{lone}"), None).await.0, 204);
 }

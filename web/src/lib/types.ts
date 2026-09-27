@@ -140,6 +140,29 @@ export interface Settings {
   longest_chain: string[]
 }
 
+export type ChildrenChoice = 'delete' | 'detach' | 'move' | 'promote'
+export type DependentsChoice = 'drop' | 'bridge' | 'children' | 'transfer'
+
+export interface DeletePlan {
+  ticket: TicketSummary
+  parent: TicketSummary | null
+  children: TicketSummary[]
+  grandchildren: TicketSummary[]
+  blockers: TicketSummary[]
+  dependents: (TicketSummary & { becomes_ready_if_dropped: boolean })[]
+  children_dependents: TicketSummary[]
+  other_links: { label: string; ticket: TicketSummary }[]
+  children_options: ChildrenChoice[]
+  dependents_options: DependentsChoice[]
+}
+
+export interface DeleteDecisions {
+  children?: ChildrenChoice
+  dependents?: DependentsChoice
+  move_to?: string
+  transfer_to?: string
+}
+
 export interface ChangeEvent {
   type: string
   project_id: number | null

@@ -1,6 +1,8 @@
 import type {
   Activity,
   Comment,
+  DeleteDecisions,
+  DeletePlan,
   GraphData,
   Label,
   LinkKind,
@@ -157,7 +159,9 @@ export const api = {
     request<TicketDetail>('PATCH', `/api/tickets/${enc(key)}`, body),
   moveTicket: (key: string, status_id: number, after: string | null) =>
     request<TicketSummary>('POST', `/api/tickets/${enc(key)}/move`, { status_id, after }),
-  deleteTicket: (key: string) => request<void>('DELETE', `/api/tickets/${enc(key)}`),
+  deletePlan: (key: string) => request<DeletePlan>('GET', `/api/tickets/${enc(key)}/delete-plan`),
+  deleteTicket: (key: string, decisions: DeleteDecisions = {}) =>
+    request<void>('DELETE', `/api/tickets/${enc(key)}${query({ ...decisions })}`),
   activity: (key: string) => request<Activity[]>('GET', `/api/tickets/${enc(key)}/activity`),
   addWatcher: (key: string, user_id: number) =>
     request<number[]>('POST', `/api/tickets/${enc(key)}/watchers`, { user_id }),

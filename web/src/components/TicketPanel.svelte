@@ -4,7 +4,7 @@
   import { capitalize, fullTime, relativeTime } from '../lib/format'
   import { projectUrl, router } from '../lib/router.svelte'
   import { app } from '../lib/store.svelte'
-  import { confirmer, toasts } from '../lib/toast.svelte'
+  import { toasts } from '../lib/toast.svelte'
   import {
     PRIORITIES,
     TYPES,
@@ -14,6 +14,7 @@
     type TicketDetail,
   } from '../lib/types'
   import Avatar from './Avatar.svelte'
+  import DeleteDialog from './DeleteDialog.svelte'
   import Icon from './Icon.svelte'
   import LabelPicker from './LabelPicker.svelte'
   import Markdown from './Markdown.svelte'
@@ -39,6 +40,7 @@
   let titleDraft = $state('')
   let titleFocused = $state(false)
   let pickingParent = $state(false)
+  let deleting = $state(false)
 
   const projectKey = $derived(ticketKey.slice(0, ticketKey.lastIndexOf('-')).toUpperCase())
   const blockers = $derived(
@@ -149,23 +151,6 @@
     if (app.actorId !== null) setWatching(app.actorId, !watching)
   }
 
-  async function remove() {
-    if (!detail) return
-    const sub = detail.type !== 'epic' && detail.child_count > 0 ? ` Its ${detail.child_count} subtasks go with it.` : ''
-    const ok = await confirmer.ask(`Delete ${detail.key}?`, `"${detail.title}" will be permanently deleted.${sub}`, {
-      confirm: 'Delete',
-      danger: true,
-    })
-    if (!ok) return
-    try {
-      await api.deleteTicket(detail.key)
-      toasts.show(`${detail.key} deleted`)
-      router.closeTicket()
-    } catch (e) {
-      toasts.error(e)
-    }
-  }
-
   function copyLink() {
     const url = `${location.origin}${projectUrl(projectKey)}?ticket=${ticketKey}`
     navigator.clipboard.writeText(url).then(() => toasts.show('Link copied', 'success', 2000))
@@ -200,7 +185,7 @@
         <Icon name="eye" size={14} />{detail.watcher_ids.length}
       </button>
       <button class="icon-btn" title="Copy link" onclick={copyLink}><Icon name="copy" size={15} /></button>
-      <button class="icon-btn" title="Delete ticket" onclick={remove}><Icon name="trash" size={15} /></button>
+      <button class="icon-btn" title="Delete ticket" onclick={() => (deleting = true)}><Icon name="trash" size={15} /></button>
     {/if}
     <button class="icon-btn" title="Close (Esc)" onclick={() => router.closeTicket()}><Icon name="x" size={16} /></button>
   </header>
@@ -435,6 +420,10 @@
     <div class="loading"><div class="shimmer"></div><div class="shimmer short"></div></div>
   {/if}
 </aside>
+
+{#if deleting}
+  <DeleteDialog {ticketKey} onclose={() => (deleting = false)} />
+{/if}
 
 <style>
   .panel {

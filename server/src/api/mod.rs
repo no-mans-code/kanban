@@ -1,4 +1,5 @@
 mod comments;
+mod deletion;
 mod labels;
 mod links;
 mod projects;
@@ -56,8 +57,9 @@ pub fn routes() -> Router<AppState> {
         .route("/api/labels", get(labels::list).post(labels::create))
         .route("/api/labels/{id}", patch(labels::update).delete(labels::delete))
         .route("/api/tickets", get(tickets::list).post(tickets::create))
-        .route("/api/tickets/{key}", get(tickets::get).patch(tickets::update).delete(tickets::delete))
+        .route("/api/tickets/{key}", get(tickets::get).patch(tickets::update).delete(deletion::delete))
         .route("/api/tickets/{key}/move", post(tickets::move_ticket))
+        .route("/api/tickets/{key}/delete-plan", get(deletion::plan))
         .route("/api/tickets/{key}/activity", get(tickets::activity))
         .route("/api/tickets/{key}/watchers", post(tickets::add_watcher))
         .route("/api/tickets/{key}/watchers/{user_id}", delete(tickets::remove_watcher))
