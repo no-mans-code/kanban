@@ -85,7 +85,8 @@ a malicious web page open in your own browser, every request's `Host` and
 even runs. Login and setup attempts are rate-limited per account. Security
 response headers (CSP, `X-Frame-Options`, etc.) are set on every response
 (`server/src/headers.rs`). None of this is a substitute for not exposing the
-board to a real network without a reverse proxy and TLS in front of it.
+board to a real network without a reverse proxy and TLS in front of it. See
+`SECURITY.md` for the full threat model, citations, and known limitations.
 
 ### Configuration (environment variables)
 
