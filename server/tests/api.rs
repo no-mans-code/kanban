@@ -363,3 +363,38 @@ async fn listing_pages_through_every_ticket() {
     let (keys, total) = page(&t, "/api/tickets?project=KAN&offset=50").await;
     assert_eq!((keys.len(), total), (0, 7));
 }
+
+async fn last_activity(t: &TestApp, key: &str) -> Value {
+    let history = t.get(&format!("/api/tickets/{key}/activity")).await;
+    history.as_array().unwrap().last().unwrap().clone()
+}
+
+#[tokio::test]
+async fn deletion_is_recorded_on_every_ticket_it_touches() {
+    let t = TestApp::new().await;
+    t.setup().await;
+    let epic = t.ticket("Epic", json!({ "type": "epic" })).await;
+    let story = t.ticket("Story", json!({ "type": "story", "parent": epic })).await;
+    let sub = t.ticket("Sub", json!({ "type": "subtask", "parent": story })).await;
+    let blocker = t.ticket("Blocker", json!({})).await;
+    let blocked = t.ticket("Blocked", json!({})).await;
+    assert_eq!(t.link(&blocker, &blocked).await.0, 201);
+    assert_eq!(t.get(&format!("/api/tickets/{blocked}")).await["is_blocked"], true);
+
+    assert_eq!(t.req(Method::DELETE, &format!("/api/tickets/{epic}"), None).await.0, 204);
+    let last = last_activity(&t, &story).await;
+    assert_eq!((last["field"].as_str(), last["old_value"].as_str()), (Some("parent"), Some(epic.as_str())));
+    assert_eq!(last["new_value"], format!("None ({epic} deleted)"));
+
+    assert_eq!(t.req(Method::DELETE, &format!("/api/tickets/{blocker}"), None).await.0, 204);
+    let last = last_activity(&t, &blocked).await;
+    assert_eq!(last["action"], "unlinked");
+    assert_eq!(last["field"], "is blocked by");
+    assert_eq!(last["old_value"], format!("{blocker} (deleted)"));
+    assert_eq!(t.get(&format!("/api/tickets/{blocked}")).await["is_blocked"], false);
+
+    assert_eq!(t.req(Method::DELETE, &format!("/api/tickets/{sub}"), None).await.0, 204);
+    let last = last_activity(&t, &story).await;
+    assert_eq!(last["action"], "child_deleted");
+    assert_eq!(last["old_value"], format!("{sub}: Sub"));
+}

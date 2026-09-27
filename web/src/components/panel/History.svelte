@@ -27,6 +27,8 @@
         return { text: `added a link: ${a.field}`, to: a.new_value }
       case 'unlinked':
         return { text: `removed a link: ${a.field}`, from: a.old_value }
+      case 'child_deleted':
+        return { text: 'deleted a child ticket', from: a.old_value }
       case 'watcher_added':
         return { text: 'added a watcher', to: a.new_value }
       case 'watcher_removed':
