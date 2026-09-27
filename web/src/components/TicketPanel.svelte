@@ -55,11 +55,21 @@
     try {
       const [d, c, a] = await Promise.all([api.ticket(key), api.comments(key), api.activity(key)])
       if (key !== ticketKey) return
+      // titleFocused only guards against a live-update refresh of THIS SAME
+      // ticket clobbering an in-progress edit. It must never suppress the
+      // sync when the ticket itself changed underneath an unblurred field
+      // (e.g. browser back/forward while typing) - otherwise a stale draft
+      // from the previous ticket sits in the box until blur, and saving it
+      // then patches the WRONG ticket's title.
+      const switchedTicket = detail?.key !== d.key
       detail = d
       comments = c
       activity = a
       missing = false
-      if (!titleFocused) titleDraft = d.title
+      if (!titleFocused || switchedTicket) {
+        titleDraft = d.title
+        if (switchedTicket) titleFocused = false
+      }
     } catch (e) {
       if (key === ticketKey) {
         missing = true
@@ -102,12 +112,19 @@
     else api.project(key).then((p) => (project = p), () => (project = null))
   })
 
+  let titleEl = $state<HTMLTextAreaElement>()
+
   $effect(() => {
-    // Reset per-ticket UI state when switching tickets.
+    // Reset per-ticket UI state when switching tickets. Blurring the title
+    // field (not just clearing the flag) matters when the switch didn't
+    // come from a click - e.g. browser back/forward - which never fires a
+    // real blur event on it otherwise.
     void ticketKey
     editingDesc = false
     pickingParent = false
     tab = 'comments'
+    if (titleFocused) titleEl?.blur()
+    titleFocused = false
   })
 
   async function patch(body: TicketPatch) {
@@ -203,6 +220,7 @@
           class="title"
           rows="1"
           bind:value={titleDraft}
+          bind:this={titleEl}
           use:autosize
           onfocus={() => (titleFocused = true)}
           onblur={saveTitle}
