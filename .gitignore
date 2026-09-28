@@ -6,3 +6,7 @@ data/
 *.db-shm
 *.db-wal
 shots/
+web/e2e/.auth/
+web/test-results/
+web/playwright-report/
+web/blob-report/

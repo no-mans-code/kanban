@@ -118,13 +118,18 @@
     // Reset per-ticket UI state when switching tickets. Blurring the title
     // field (not just clearing the flag) matters when the switch didn't
     // come from a click - e.g. browser back/forward - which never fires a
-    // real blur event on it otherwise.
+    // real blur event on it otherwise. Reading titleFocused has to be
+    // untracked: this effect must only re-run when ticketKey changes, not
+    // every time the field's focus state does (that would re-blur it the
+    // instant it's focused, discarding every keystroke).
     void ticketKey
     editingDesc = false
     pickingParent = false
     tab = 'comments'
-    if (titleFocused) titleEl?.blur()
-    titleFocused = false
+    untrack(() => {
+      if (titleFocused) titleEl?.blur()
+      titleFocused = false
+    })
   })
 
   async function patch(body: TicketPatch) {

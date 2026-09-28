@@ -276,6 +276,8 @@ kanban/
     src/components/                 SetupView, LoginView, AccountMenu, BoardView (drag and drop), ListView,
                                     GraphView (lazy-loaded; ELK is ~1.4MB), TicketPanel (+ panel/*), CreateTicket,
                                     SettingsView (+ settings/PeoplePanel, settings/TokensPanel), ProjectMembers, Sidebar, Topbar
+    e2e/                            Playwright UI tests against a real, Docker-built board (no mocks) — see its own
+                                    playwright.config.ts for how the board instance is provisioned; `npm run test:e2e`
 ```
 
 ### Data model (SQLite)
@@ -427,12 +429,14 @@ Global settings go in the `settings` table through `api/settings.rs`.
 ```bash
 cd server && cargo fmt && cargo clippy --all-targets && cargo test   # unit + api + auth + mcp tests
 cd web && npx svelte-check --tsconfig ./tsconfig.app.json && npm run build
+cd web && npm run test:e2e   # Playwright, needs Docker; builds and runs the real image
 ```
 
-For UI changes, also run the app and try the feature in a browser; the test
-suites don't cover the UI. Development with hot reload uses two terminals:
-`cd server && cargo run -- --demo` (API on :8610) and `cd web && npm run dev`
-(UI on http://localhost:5173, which proxies `/api` to :8610).
+For a UI change, also try the feature yourself in a browser — the Playwright
+suite (`web/e2e/`) covers the flows it covers, not every interaction.
+Development with hot reload uses two terminals: `cd server && cargo run --
+--demo` (API on :8610) and `cd web && npm run dev` (UI on
+http://localhost:5173, which proxies `/api` to :8610).
 
 ### Gotchas (each of these was hit for real while building this)
 
