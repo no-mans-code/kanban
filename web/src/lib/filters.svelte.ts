@@ -1,6 +1,39 @@
 import { isOverdue } from './format'
 import type { TicketSummary } from './types'
 
+/** A named snapshot of a filter combination. Per-user, not shared - lives
+ * only in this browser's localStorage, not the server. */
+export interface SavedFilter {
+  id: string
+  name: string
+  projectKey: string
+  text: string
+  assignees: (number | 'none')[]
+  type: string
+  priority: string
+  label: number | null
+  overdue: boolean
+}
+
+const SAVED_KEY = 'kanban.savedFilters'
+
+function loadSaved(): SavedFilter[] {
+  try {
+    const raw = localStorage.getItem(SAVED_KEY)
+    return raw ? JSON.parse(raw) : []
+  } catch {
+    return []
+  }
+}
+
+function persistSaved(list: SavedFilter[]) {
+  try {
+    localStorage.setItem(SAVED_KEY, JSON.stringify(list))
+  } catch {
+    // Private mode or blocked storage: it just won't persist.
+  }
+}
+
 class Filters {
   text = $state('')
   /** '' any, 'none' unassigned, otherwise user ids */
@@ -11,6 +44,7 @@ class Filters {
   overdue = $state(false)
   /** Keys the server's full-text search matched (descriptions, comments). */
   serverHits = $state<Set<string> | null>(null)
+  saved = $state<SavedFilter[]>(loadSaved())
 
   active = $derived(
     this.text.trim() !== '' ||
@@ -52,6 +86,37 @@ class Filters {
     this.label = null
     this.overdue = false
     this.serverHits = null
+  }
+
+  save(name: string, projectKey: string) {
+    const entry: SavedFilter = {
+      id: crypto.randomUUID(),
+      name,
+      projectKey,
+      text: this.text,
+      assignees: [...this.assignees],
+      type: this.type,
+      priority: this.priority,
+      label: this.label,
+      overdue: this.overdue,
+    }
+    this.saved = [...this.saved, entry]
+    persistSaved(this.saved)
+  }
+
+  apply(f: SavedFilter) {
+    this.text = f.text
+    this.assignees = [...f.assignees]
+    this.type = f.type
+    this.priority = f.priority
+    this.label = f.label
+    this.overdue = f.overdue
+    this.serverHits = null
+  }
+
+  removeSaved(id: string) {
+    this.saved = this.saved.filter((f) => f.id !== id)
+    persistSaved(this.saved)
   }
 }
 

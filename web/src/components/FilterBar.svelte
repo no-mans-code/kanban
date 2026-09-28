@@ -6,8 +6,20 @@
   import { PRIORITIES, TYPES } from '../lib/types'
   import Avatar from './Avatar.svelte'
   import Icon from './Icon.svelte'
+  import Popover from './Popover.svelte'
 
   let { project, count, total }: { project: string; count: number; total: number } = $props()
+
+  const savedForProject = $derived(filters.saved.filter((f) => f.projectKey === project))
+  let newFilterName = $state('')
+
+  function saveCurrent(close: () => void) {
+    const name = newFilterName.trim()
+    if (!name) return
+    filters.save(name, project)
+    newFilterName = ''
+    close()
+  }
 
   const search = debounce(async (q: string, key: string) => {
     if (!q.trim()) {
@@ -84,6 +96,49 @@
   >
     <Icon name="calendar" size={13} /> Overdue
   </button>
+
+  <Popover width={220}>
+    {#snippet trigger({ toggle })}
+      <button class="btn btn-ghost btn-sm" onclick={toggle} title="Saved filters">
+        <Icon name="bookmark" size={13} /> Saved
+      </button>
+    {/snippet}
+    {#snippet children({ close })}
+      {#each savedForProject as f (f.id)}
+        <div class="saved-row">
+          <button
+            class="opt"
+            onclick={() => {
+              filters.apply(f)
+              close()
+            }}
+          >
+            {f.name}
+          </button>
+          <button class="icon-btn tiny" title="Remove" onclick={() => filters.removeSaved(f.id)}>
+            <Icon name="x" size={12} />
+          </button>
+        </div>
+      {:else}
+        <p class="muted small">No saved filters for this project yet.</p>
+      {/each}
+      {#if filters.active}
+        <div class="save-row">
+          <input
+            class="input"
+            placeholder="Name this filter"
+            bind:value={newFilterName}
+            onkeydown={(e) => e.key === 'Enter' && saveCurrent(close)}
+          />
+          <button class="btn btn-sm" disabled={!newFilterName.trim()} onclick={() => saveCurrent(close)}>
+            Save
+          </button>
+        </div>
+      {:else}
+        <p class="muted small">Set some filters above to save them.</p>
+      {/if}
+    {/snippet}
+  </Popover>
 
   {#if filters.active}
     <button class="btn btn-ghost btn-sm" onclick={() => filters.clear()}>Clear</button>
@@ -162,5 +217,46 @@
     border-color: var(--danger);
     color: var(--danger);
     background: var(--danger-soft);
+  }
+  .saved-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .saved-row .opt {
+    flex: 1;
+  }
+  .opt {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    padding: 6px 8px;
+    border: none;
+    border-radius: var(--radius-sm);
+    background: none;
+    text-align: left;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .opt:hover {
+    background: var(--surface-2);
+  }
+  .tiny {
+    width: 22px;
+    height: 22px;
+    flex: none;
+  }
+  .small {
+    font-size: 12px;
+  }
+  .save-row {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+  }
+  .save-row .input {
+    flex: 1;
+    min-width: 0;
+    height: 30px;
   }
 </style>
