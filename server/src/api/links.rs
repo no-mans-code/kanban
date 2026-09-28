@@ -141,7 +141,9 @@ async fn height_error(
     }
 }
 
-async fn record(
+/// Also used by `comments::create` to log the `relates` links it makes from
+/// ticket-key mentions.
+pub(super) async fn record(
     conn: &mut sqlx::SqliteConnection,
     source: i64,
     target: i64,

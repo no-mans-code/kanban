@@ -243,6 +243,41 @@ async fn search_covers_titles_descriptions_comments_and_keys() {
 }
 
 #[tokio::test]
+async fn mentioning_a_ticket_key_in_a_comment_links_it() {
+    let t = TestApp::new().await;
+    t.setup().await;
+    let a = t.ticket("A", json!({})).await;
+    let b = t.ticket("B", json!({})).await;
+    let c = t.ticket("C", json!({})).await;
+
+    t.ok(
+        Method::POST,
+        &format!("/api/tickets/{a}/comments"),
+        json!({ "body": format!("Related to {b} and also, again, {b}.") }),
+    )
+    .await;
+
+    let da = t.get(&format!("/api/tickets/{a}")).await;
+    let db = t.get(&format!("/api/tickets/{b}")).await;
+    let dc = t.get(&format!("/api/tickets/{c}")).await;
+    assert_eq!(da["links"].as_array().unwrap().len(), 1, "one relates link, not one per mention");
+    assert_eq!(da["links"][0]["ticket"]["key"], json!(b));
+    assert_eq!(da["links"][0]["kind"], json!("relates"));
+    assert_eq!(db["links"][0]["ticket"]["key"], json!(a));
+    assert!(dc["links"].as_array().unwrap().is_empty(), "C was never mentioned");
+
+    // Mentioning yourself, or a ticket already linked, is a no-op, not an error.
+    t.ok(
+        Method::POST,
+        &format!("/api/tickets/{a}/comments"),
+        json!({ "body": format!("{a} again mentions {b}.") }),
+    )
+    .await;
+    let da = t.get(&format!("/api/tickets/{a}")).await;
+    assert_eq!(da["links"].as_array().unwrap().len(), 1, "no duplicate or self link created");
+}
+
+#[tokio::test]
 async fn edits_are_recorded_in_history() {
     let t = TestApp::new().await;
     let project = t.setup().await;

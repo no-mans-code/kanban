@@ -4,6 +4,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use sqlx::SqliteConnection;
 
+use super::links::record as record_link;
 use crate::auth::{Auth, Role};
 use crate::error::{ApiResult, AppError};
 use crate::models::{Comment, log_activity, reindex, resolve_key, watch};
@@ -20,6 +21,74 @@ fn clean_body(body: &str) -> ApiResult<String> {
         return Err(AppError::invalid("Comment is limited to 100,000 bytes"));
     }
     Ok(b.to_string())
+}
+
+/// Ticket keys mentioned in a comment body (e.g. "see KAN-3"), deduplicated.
+/// A candidate is a maximal run of ASCII letters/digits/hyphens shaped like
+/// a real key: a project key (2-10 chars, a letter then letters/digits),
+/// '-', then a number. Mirrors the project-key rules in `projects::clean_key`.
+fn mentioned_keys(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = body
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .filter_map(|word| {
+            let (project, number) = word.rsplit_once('-')?;
+            let project = project.to_ascii_uppercase();
+            let mut chars = project.chars();
+            let key_ok = (2..=10).contains(&project.len())
+                && chars.next().is_some_and(|c| c.is_ascii_uppercase())
+                && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+            let number_ok = !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
+            (key_ok && number_ok).then(|| format!("{project}-{number}"))
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Links `ticket_id` to every ticket mentioned by key in `body` that exists
+/// and is visible to `p`, skipping ones already linked in some way. Mentions
+/// of the ticket's own key, or of keys that don't resolve or aren't visible,
+/// are ignored rather than failing the comment.
+async fn link_mentions(
+    tx: &mut sqlx::SqliteConnection,
+    p: &crate::auth::Principal,
+    ticket_id: i64,
+    body: &str,
+    actor: Option<i64>,
+) -> ApiResult<()> {
+    for key in mentioned_keys(body) {
+        let Ok(mentioned_id) = resolve_key(tx, &key).await else { continue };
+        if mentioned_id == ticket_id {
+            continue;
+        }
+        if p.require_ticket(tx, mentioned_id, Role::Viewer).await.is_err() {
+            continue;
+        }
+        let existing: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ticket_links WHERE kind = 'relates'
+              AND ((source_id = ? AND target_id = ?) OR (source_id = ? AND target_id = ?))",
+        )
+        .bind(ticket_id)
+        .bind(mentioned_id)
+        .bind(mentioned_id)
+        .bind(ticket_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if existing > 0 {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO ticket_links (source_id, target_id, kind, created_at) VALUES (?, ?, 'relates', ?)",
+        )
+        .bind(ticket_id)
+        .bind(mentioned_id)
+        .bind(now_ms())
+        .execute(&mut *tx)
+        .await?;
+        record_link(tx, ticket_id, mentioned_id, "relates", actor, "linked").await?;
+    }
+    Ok(())
 }
 
 async fn load(conn: &mut SqliteConnection, id: i64) -> ApiResult<Comment> {
@@ -107,6 +176,7 @@ pub async fn create(
     watch(&mut tx, ticket_id, actor).await?;
     log_activity(&mut tx, ticket_id, actor, "commented", None, None, Some(excerpt(&body))).await?;
     reindex(&mut tx, ticket_id).await?;
+    link_mentions(&mut tx, &p, ticket_id, &body, actor).await?;
     let comment = load(&mut tx, id).await?;
     let (project_id, ticket_key) = project_and_key(&mut tx, ticket_id).await?;
     tx.commit().await?;
@@ -188,4 +258,41 @@ pub async fn delete(
     tx.commit().await?;
     state.events.emit("comment.changed", Some(project_id), &[ticket_key]);
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mentioned_keys;
+
+    #[test]
+    fn finds_plain_mentions() {
+        assert_eq!(mentioned_keys("See KAN-3 for context."), vec!["KAN-3"]);
+    }
+
+    #[test]
+    fn dedupes_and_sorts() {
+        assert_eq!(mentioned_keys("KAN-9 blocks KAN-2, also KAN-9 again"), vec!["KAN-2", "KAN-9"]);
+    }
+
+    #[test]
+    fn uppercases_lowercase_mentions() {
+        assert_eq!(mentioned_keys("fixed in kan-3"), vec!["KAN-3"]);
+    }
+
+    #[test]
+    fn ignores_non_key_shapes() {
+        assert!(mentioned_keys("k-3 A-3 TOOLONGKEY9-3 KAN-3x plain text 2024-01-01").is_empty());
+    }
+
+    #[test]
+    fn rejects_hyphenated_project_part() {
+        // rsplit_once takes the LAST '-', so "PART-OF-KAN-3" has project
+        // "PART-OF-KAN" which fails the letters/digits-only check.
+        assert!(mentioned_keys("PART-OF-KAN-3").is_empty());
+    }
+
+    #[test]
+    fn picks_multiple_distinct_mentions() {
+        assert_eq!(mentioned_keys("KAN-1 and PER-42 are related"), vec!["KAN-1", "PER-42"]);
+    }
 }
