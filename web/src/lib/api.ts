@@ -1,6 +1,7 @@
 import type {
   Activity,
   Comment,
+  Component,
   DeleteDecisions,
   DeletePlan,
   GraphData,
@@ -16,6 +17,7 @@ import type {
   TicketSummary,
   ApiToken,
   User,
+  Version,
 } from './types'
 
 export class ApiError extends Error {
@@ -114,6 +116,8 @@ export interface TicketInput {
   parent?: string | null
   label_ids?: number[]
   due_date?: number | null
+  component_id?: number | null
+  fix_version_id?: number | null
 }
 
 export type TicketPatch = Partial<{
@@ -126,6 +130,8 @@ export type TicketPatch = Partial<{
   parent: string | null
   label_ids: number[]
   due_date: number | null
+  component_id: number | null
+  fix_version_id: number | null
 }>
 
 export interface CreateTokenInput {
@@ -178,6 +184,14 @@ export const api = {
   createLabel: (body: { name: string; color?: string }) => request<Label>('POST', '/api/labels', body),
   updateLabel: (id: number, body: Partial<{ name: string; color: string }>) => request<Label>('PATCH', `/api/labels/${id}`, body),
   deleteLabel: (id: number) => request<void>('DELETE', `/api/labels/${id}`),
+
+  components: (key: string) => request<Component[]>('GET', `/api/projects/${enc(key)}/components`),
+  createComponent: (key: string, name: string) => request<Component[]>('POST', `/api/projects/${enc(key)}/components`, { name }),
+  deleteComponent: (id: number) => request<void>('DELETE', `/api/components/${id}`),
+
+  versions: (key: string) => request<Version[]>('GET', `/api/projects/${enc(key)}/versions`),
+  createVersion: (key: string, name: string) => request<Version[]>('POST', `/api/projects/${enc(key)}/versions`, { name }),
+  deleteVersion: (id: number) => request<void>('DELETE', `/api/versions/${id}`),
 
   /** One page (default 2000). For views that must show everything, use allTickets. */
   tickets: (q: TicketQuery) => request<TicketSummary[]>('GET', `/api/tickets${query({ ...q })}`),

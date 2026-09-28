@@ -9,7 +9,8 @@ use sqlx::SqliteConnection;
 use crate::auth::{Auth, Principal, Role};
 use crate::error::{ApiResult, AppError};
 use crate::models::{
-    CATEGORIES, Project, Status, check_one_of, double_option, log_activity, project_id_by_key,
+    CATEGORIES, Component, Project, Status, Version, check_one_of, double_option, log_activity,
+    project_id_by_key,
 };
 use crate::{AppState, now_ms, write_tx};
 
@@ -21,6 +22,8 @@ pub struct ProjectDetail {
     #[serde(flatten)]
     project: Project,
     statuses: Vec<Status>,
+    components: Vec<Component>,
+    versions: Vec<Version>,
     /// The caller's role here: viewer | member | admin.
     role: &'static str,
 }
@@ -51,7 +54,9 @@ async fn load_detail(conn: &mut SqliteConnection, project_id: i64, role: Role) -
     .fetch_one(&mut *conn)
     .await?;
     let statuses = load_statuses(conn, project_id).await?;
-    Ok(ProjectDetail { project, statuses, role: role.as_str() })
+    let components = load_components(conn, project_id).await?;
+    let versions = load_versions(conn, project_id).await?;
+    Ok(ProjectDetail { project, statuses, components, versions, role: role.as_str() })
 }
 
 /// Only the projects the caller can see, each with the caller's role there.
@@ -452,6 +457,194 @@ pub async fn reorder_statuses(
     tx.commit().await?;
     state.events.emit("project.changed", Some(project_id), &[]);
     Ok(Json(statuses))
+}
+
+// ---------------------------------------------------------------- components & versions
+
+// Components and versions are simple per-project taxonomies — like labels,
+// but scoped to one project instead of shared board-wide, and (for a first
+// cut) create/delete only, no rename. Structurally identical to each
+// other; kept as two small parallel blocks rather than one generic helper,
+// since Rust makes genuinely DRYing two different tables more machinery
+// than the duplication it would save.
+
+async fn load_components(conn: &mut SqliteConnection, project_id: i64) -> ApiResult<Vec<Component>> {
+    Ok(sqlx::query_as::<_, Component>(
+        "SELECT id, project_id, name FROM components WHERE project_id = ? ORDER BY name",
+    )
+    .bind(project_id)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
+pub async fn list_components(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path(key): Path<String>,
+) -> ApiResult<Json<Vec<Component>>> {
+    let mut conn = state.db.acquire().await?;
+    let id = project_id_by_key(&mut conn, &key).await?;
+    p.require(&mut conn, id, Role::Viewer).await?;
+    Ok(Json(load_components(&mut conn, id).await?))
+}
+
+#[derive(Deserialize)]
+pub struct CreateTaxonomy {
+    name: String,
+}
+
+pub async fn create_component(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path(key): Path<String>,
+    Json(body): Json<CreateTaxonomy>,
+) -> ApiResult<(StatusCode, Json<Vec<Component>>)> {
+    p.require_writable()?;
+    let name = clean_name(&body.name, "Component name")?;
+    let mut tx = write_tx(&state.db).await?;
+    let project_id = project_id_by_key(&mut tx, &key).await?;
+    p.require(&mut tx, project_id, Role::Admin).await?;
+    sqlx::query("INSERT INTO components (project_id, name) VALUES (?, ?)")
+        .bind(project_id)
+        .bind(&name)
+        .execute(&mut *tx)
+        .await?;
+    let components = load_components(&mut tx, project_id).await?;
+    tx.commit().await?;
+    state.events.emit("project.changed", Some(project_id), &[]);
+    Ok((StatusCode::CREATED, Json(components)))
+}
+
+pub async fn delete_component(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    p.require_writable()?;
+    let mut tx = write_tx(&state.db).await?;
+    let project_id: i64 = sqlx::query_scalar("SELECT project_id FROM components WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found("Component"))?;
+    p.require(&mut tx, project_id, Role::Admin).await?;
+    sqlx::query("DELETE FROM components WHERE id = ?").bind(id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    state.events.emit("project.changed", Some(project_id), &[]);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn load_versions(conn: &mut SqliteConnection, project_id: i64) -> ApiResult<Vec<Version>> {
+    Ok(sqlx::query_as::<_, Version>(
+        "SELECT id, project_id, name FROM versions WHERE project_id = ? ORDER BY name",
+    )
+    .bind(project_id)
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
+pub async fn list_versions(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path(key): Path<String>,
+) -> ApiResult<Json<Vec<Version>>> {
+    let mut conn = state.db.acquire().await?;
+    let id = project_id_by_key(&mut conn, &key).await?;
+    p.require(&mut conn, id, Role::Viewer).await?;
+    Ok(Json(load_versions(&mut conn, id).await?))
+}
+
+pub async fn create_version(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path(key): Path<String>,
+    Json(body): Json<CreateTaxonomy>,
+) -> ApiResult<(StatusCode, Json<Vec<Version>>)> {
+    p.require_writable()?;
+    let name = clean_name(&body.name, "Version name")?;
+    let mut tx = write_tx(&state.db).await?;
+    let project_id = project_id_by_key(&mut tx, &key).await?;
+    p.require(&mut tx, project_id, Role::Admin).await?;
+    sqlx::query("INSERT INTO versions (project_id, name) VALUES (?, ?)")
+        .bind(project_id)
+        .bind(&name)
+        .execute(&mut *tx)
+        .await?;
+    let versions = load_versions(&mut tx, project_id).await?;
+    tx.commit().await?;
+    state.events.emit("project.changed", Some(project_id), &[]);
+    Ok((StatusCode::CREATED, Json(versions)))
+}
+
+pub async fn delete_version(
+    State(state): State<AppState>,
+    Auth(p): Auth,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    p.require_writable()?;
+    let mut tx = write_tx(&state.db).await?;
+    let project_id: i64 = sqlx::query_scalar("SELECT project_id FROM versions WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found("Version"))?;
+    p.require(&mut tx, project_id, Role::Admin).await?;
+    sqlx::query("DELETE FROM versions WHERE id = ?").bind(id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    state.events.emit("project.changed", Some(project_id), &[]);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Checks a component belongs to `project_id`, if one is given.
+pub(crate) async fn check_component(
+    conn: &mut SqliteConnection,
+    id: Option<i64>,
+    project_id: i64,
+) -> ApiResult<()> {
+    let Some(id) = id else { return Ok(()) };
+    let owner: Option<i64> = sqlx::query_scalar("SELECT project_id FROM components WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if owner != Some(project_id) {
+        return Err(AppError::invalid("That component does not belong to this ticket's project"));
+    }
+    Ok(())
+}
+
+/// Checks a version belongs to `project_id`, if one is given.
+pub(crate) async fn check_version(
+    conn: &mut SqliteConnection,
+    id: Option<i64>,
+    project_id: i64,
+) -> ApiResult<()> {
+    let Some(id) = id else { return Ok(()) };
+    let owner: Option<i64> = sqlx::query_scalar("SELECT project_id FROM versions WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?;
+    if owner != Some(project_id) {
+        return Err(AppError::invalid("That version does not belong to this ticket's project"));
+    }
+    Ok(())
+}
+
+pub(crate) async fn component_name(conn: &mut SqliteConnection, id: Option<i64>) -> ApiResult<String> {
+    let Some(id) = id else { return Ok("None".into()) };
+    sqlx::query_scalar("SELECT name FROM components WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::invalid(format!("Component {id} does not exist")))
+}
+
+pub(crate) async fn version_name(conn: &mut SqliteConnection, id: Option<i64>) -> ApiResult<String> {
+    let Some(id) = id else { return Ok("None".into()) };
+    sqlx::query_scalar("SELECT name FROM versions WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::invalid(format!("Version {id} does not exist")))
 }
 
 // ---------------------------------------------------------------- members

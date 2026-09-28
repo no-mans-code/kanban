@@ -111,6 +111,53 @@
     await wfCall(() => api.project(wfKey).then((p) => p.statuses))
   }
 
+  // ------------------------------------------------ components & versions
+  let newComponent = $state('')
+  let newVersion = $state('')
+
+  async function taxonomyCall(fn: () => Promise<void>) {
+    try {
+      await fn()
+      if (app.project?.key === wfKey) app.reloadProject()
+    } catch (e) {
+      toasts.error(e)
+    }
+  }
+
+  function addComponent() {
+    const name = newComponent.trim()
+    if (!name || !wf) return
+    taxonomyCall(async () => {
+      const components = await api.createComponent(wfKey, name)
+      if (wf) wf.components = components
+      newComponent = ''
+    })
+  }
+
+  function deleteComponent(id: number) {
+    taxonomyCall(async () => {
+      await api.deleteComponent(id)
+      if (wf) wf.components = wf.components.filter((c) => c.id !== id)
+    })
+  }
+
+  function addVersion() {
+    const name = newVersion.trim()
+    if (!name || !wf) return
+    taxonomyCall(async () => {
+      const versions = await api.createVersion(wfKey, name)
+      if (wf) wf.versions = versions
+      newVersion = ''
+    })
+  }
+
+  function deleteVersion(id: number) {
+    taxonomyCall(async () => {
+      await api.deleteVersion(id)
+      if (wf) wf.versions = wf.versions.filter((v) => v.id !== id)
+    })
+  }
+
   // ------------------------------------------------ labels
   let newLabel = $state('')
 
@@ -272,6 +319,44 @@
                 {#each CATEGORIES as c (c)}<option value={c}>{CATEGORY_NAMES[c]}</option>{/each}
               </select>
               <button class="btn" disabled={!newStatus.trim()} onclick={addStatus}>Add</button>
+            </div>
+          {/if}
+        </div>
+
+        <h2>Components</h2>
+        <p class="lead">Optional per-ticket grouping, scoped to {wf.key}.</p>
+        <div class="rows">
+          {#each wf.components as c (c.id)}
+            <div class="row">
+              <span class="grow">{c.name}</span>
+              {#if canEditWorkflow}
+                <button class="icon-btn" title="Delete" onclick={() => deleteComponent(c.id)}><Icon name="trash" size={14} /></button>
+              {/if}
+            </div>
+          {/each}
+          {#if canEditWorkflow}
+            <div class="row add">
+              <input class="input grow" placeholder="New component" bind:value={newComponent} onkeydown={(e) => e.key === 'Enter' && addComponent()} />
+              <button class="btn" disabled={!newComponent.trim()} onclick={addComponent}>Add</button>
+            </div>
+          {/if}
+        </div>
+
+        <h2>Versions</h2>
+        <p class="lead">Optional fix-version tracking, scoped to {wf.key}.</p>
+        <div class="rows">
+          {#each wf.versions as v (v.id)}
+            <div class="row">
+              <span class="grow">{v.name}</span>
+              {#if canEditWorkflow}
+                <button class="icon-btn" title="Delete" onclick={() => deleteVersion(v.id)}><Icon name="trash" size={14} /></button>
+              {/if}
+            </div>
+          {/each}
+          {#if canEditWorkflow}
+            <div class="row add">
+              <input class="input grow" placeholder="New version" bind:value={newVersion} onkeydown={(e) => e.key === 'Enter' && addVersion()} />
+              <button class="btn" disabled={!newVersion.trim()} onclick={addVersion}>Add</button>
             </div>
           {/if}
         </div>

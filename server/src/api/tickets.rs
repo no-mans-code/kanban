@@ -6,6 +6,7 @@ use axum::http::{HeaderName, StatusCode};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, QueryBuilder, Sqlite, SqliteConnection};
 
+use super::projects::{check_component, check_version, component_name, version_name};
 use crate::auth::{Auth, Principal, Role};
 use crate::error::{ApiResult, AppError};
 use crate::models::{
@@ -291,11 +292,14 @@ struct TicketRow {
     assignee_id: Option<i64>,
     parent_id: Option<i64>,
     due_date: Option<i64>,
+    component_id: Option<i64>,
+    fix_version_id: Option<i64>,
 }
 
 async fn load_row(conn: &mut SqliteConnection, id: i64) -> ApiResult<TicketRow> {
     Ok(sqlx::query_as::<_, TicketRow>(
-        "SELECT id, project_id, type AS ticket_type, title, description, status_id, priority, assignee_id, parent_id, due_date
+        "SELECT id, project_id, type AS ticket_type, title, description, status_id, priority, assignee_id,
+                parent_id, due_date, component_id, fix_version_id
            FROM tickets WHERE id = ?",
     )
     .bind(id)
@@ -435,6 +439,8 @@ pub struct CreateTicket {
     #[serde(default)]
     watcher_ids: Vec<i64>,
     due_date: Option<i64>,
+    component_id: Option<i64>,
+    fix_version_id: Option<i64>,
 }
 
 pub async fn create(
@@ -472,6 +478,8 @@ pub async fn create(
     if body.assignee_id.is_some() {
         user_name(&mut tx, body.assignee_id).await?;
     }
+    check_component(&mut tx, body.component_id, project_id).await?;
+    check_version(&mut tx, body.fix_version_id, project_id).await?;
 
     let number: i64 = sqlx::query_scalar(
         "UPDATE projects SET next_number = next_number + 1 WHERE id = ? RETURNING next_number - 1",
@@ -483,8 +491,9 @@ pub async fn create(
     let now = now_ms();
     let id = sqlx::query(
         "INSERT INTO tickets (project_id, number, type, title, description, status_id, priority,
-                              assignee_id, reporter_id, parent_id, rank, created_at, updated_at, resolved_at, due_date)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                              assignee_id, reporter_id, parent_id, rank, created_at, updated_at, resolved_at, due_date,
+                              component_id, fix_version_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(project_id)
     .bind(number)
@@ -501,6 +510,8 @@ pub async fn create(
     .bind(now)
     .bind((category == "done").then_some(now))
     .bind(body.due_date)
+    .bind(body.component_id)
+    .bind(body.fix_version_id)
     .execute(&mut *tx)
     .await?
     .last_insert_rowid();
@@ -538,6 +549,10 @@ pub struct UpdateTicket {
     label_ids: Option<Vec<i64>>,
     #[serde(default, deserialize_with = "double_option")]
     due_date: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    component_id: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    fix_version_id: Option<Option<i64>>,
 }
 
 pub async fn update(
@@ -629,6 +644,34 @@ pub async fn update(
             due_date.map(iso_date),
         )
         .await?;
+        changed = true;
+    }
+    if let Some(component_id) = body.component_id
+        && component_id != row.component_id
+    {
+        check_component(&mut tx, component_id, row.project_id).await?;
+        let old = component_name(&mut tx, row.component_id).await?;
+        let new = component_name(&mut tx, component_id).await?;
+        sqlx::query("UPDATE tickets SET component_id = ? WHERE id = ?")
+            .bind(component_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        log_activity(&mut tx, id, actor, "updated", Some("component"), Some(old), Some(new)).await?;
+        changed = true;
+    }
+    if let Some(fix_version_id) = body.fix_version_id
+        && fix_version_id != row.fix_version_id
+    {
+        check_version(&mut tx, fix_version_id, row.project_id).await?;
+        let old = version_name(&mut tx, row.fix_version_id).await?;
+        let new = version_name(&mut tx, fix_version_id).await?;
+        sqlx::query("UPDATE tickets SET fix_version_id = ? WHERE id = ?")
+            .bind(fix_version_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        log_activity(&mut tx, id, actor, "updated", Some("fix_version"), Some(old), Some(new)).await?;
         changed = true;
     }
 

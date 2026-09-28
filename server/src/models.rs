@@ -104,6 +104,20 @@ pub struct Label {
 }
 
 #[derive(Serialize, FromRow)]
+pub struct Component {
+    pub id: i64,
+    pub project_id: i64,
+    pub name: String,
+}
+
+#[derive(Serialize, FromRow)]
+pub struct Version {
+    pub id: i64,
+    pub project_id: i64,
+    pub name: String,
+}
+
+#[derive(Serialize, FromRow)]
 pub struct Comment {
     pub id: i64,
     pub ticket_id: i64,
@@ -149,6 +163,8 @@ pub struct TicketSummary {
     pub updated_at: i64,
     pub resolved_at: Option<i64>,
     pub due_date: Option<i64>,
+    pub component_id: Option<i64>,
+    pub fix_version_id: Option<i64>,
     #[serde(serialize_with = "id_list")]
     pub label_ids: String,
     pub child_count: i64,
@@ -167,6 +183,7 @@ SELECT t.id,
        (SELECT pp.key || '-' || pt.number FROM tickets pt JOIN projects pp ON pp.id = pt.project_id
          WHERE pt.id = t.parent_id) AS parent_key,
        t.rank, t.created_at, t.updated_at, t.resolved_at, t.due_date,
+       t.component_id, t.fix_version_id,
        COALESCE((SELECT group_concat(tl.label_id) FROM ticket_labels tl WHERE tl.ticket_id = t.id), '')
          AS label_ids,
        (SELECT count(*) FROM tickets c WHERE c.parent_id = t.id) AS child_count,

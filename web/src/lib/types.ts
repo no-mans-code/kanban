@@ -102,8 +102,22 @@ export interface Status {
   wip_limit: number | null
 }
 
+export interface Component {
+  id: number
+  project_id: number
+  name: string
+}
+
+export interface Version {
+  id: number
+  project_id: number
+  name: string
+}
+
 export interface ProjectDetail extends Project {
   statuses: Status[]
+  components: Component[]
+  versions: Version[]
   role: Role
 }
 
@@ -133,6 +147,8 @@ export interface TicketSummary {
   updated_at: number
   resolved_at: number | null
   due_date: number | null
+  component_id: number | null
+  fix_version_id: number | null
   label_ids: number[]
   child_count: number
   done_child_count: number

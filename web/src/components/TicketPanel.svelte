@@ -385,6 +385,32 @@
           </div>
         </div>
 
+        <div class="field">
+          <span class="field-label">Component</span>
+          <select
+            class="select bare"
+            value={detail.component_id === null ? '' : String(detail.component_id)}
+            onchange={(e) => patch({ component_id: e.currentTarget.value ? Number(e.currentTarget.value) : null })}
+            aria-label="Component"
+          >
+            <option value="">None</option>
+            {#each project?.components ?? [] as c (c.id)}<option value={c.id}>{c.name}</option>{/each}
+          </select>
+        </div>
+
+        <div class="field">
+          <span class="field-label">Fix version</span>
+          <select
+            class="select bare"
+            value={detail.fix_version_id === null ? '' : String(detail.fix_version_id)}
+            onchange={(e) => patch({ fix_version_id: e.currentTarget.value ? Number(e.currentTarget.value) : null })}
+            aria-label="Fix version"
+          >
+            <option value="">None</option>
+            {#each project?.versions ?? [] as v (v.id)}<option value={v.id}>{v.name}</option>{/each}
+          </select>
+        </div>
+
         {#if detail.type !== 'epic'}
           <div class="field">
             <span class="field-label">Parent</span>

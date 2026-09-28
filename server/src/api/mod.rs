@@ -50,6 +50,13 @@ pub fn routes() -> Router<AppState> {
         .route("/api/projects/{key}/statuses", get(projects::list_statuses).post(projects::create_status))
         .route("/api/projects/{key}/statuses/order", put(projects::reorder_statuses))
         .route("/api/statuses/{id}", patch(projects::update_status).delete(projects::delete_status))
+        .route(
+            "/api/projects/{key}/components",
+            get(projects::list_components).post(projects::create_component),
+        )
+        .route("/api/components/{id}", delete(projects::delete_component))
+        .route("/api/projects/{key}/versions", get(projects::list_versions).post(projects::create_version))
+        .route("/api/versions/{id}", delete(projects::delete_version))
         .route("/api/labels", get(labels::list).post(labels::create))
         .route("/api/labels/{id}", patch(labels::update).delete(labels::delete))
         .route("/api/tickets", get(tickets::list).post(tickets::create))

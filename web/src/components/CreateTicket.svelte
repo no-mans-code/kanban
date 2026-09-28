@@ -23,6 +23,8 @@
   let parent = $state<TicketSummary | null>(null)
   let labels = $state<number[]>([])
   let dueDate = $state<number | null>(null)
+  let componentId = $state<number | null>(null)
+  let fixVersionId = $state<number | null>(null)
   let another = $state(false)
   let saving = $state(false)
 
@@ -30,6 +32,13 @@
     const key = projectKey
     if (!key) return
     if (project?.key !== key) api.project(key).then((p) => (project = p), toasts.error.bind(toasts))
+  })
+
+  $effect(() => {
+    // Components/versions are per-project: a picked one may no longer apply.
+    void projectKey
+    componentId = null
+    fixVersionId = null
   })
 
   const needsParent = $derived(type === 'subtask')
@@ -65,12 +74,16 @@
         parent: parentAllowed ? (parent?.key ?? null) : null,
         label_ids: labels,
         due_date: dueDate,
+        component_id: componentId,
+        fix_version_id: fixVersionId,
       })
       toasts.show(`Created ${t.key}`, 'success')
       if (another) {
         title = ''
         description = ''
         dueDate = null
+        componentId = null
+        fixVersionId = null
       } else {
         onclose()
         router.openTicket(t.key)
@@ -147,6 +160,20 @@
           value={dateInputValue(dueDate)}
           onchange={(e) => (dueDate = dateInputToMs(e.currentTarget.value))}
         />
+      </label>
+      <label>
+        <span class="field-label">Component</span>
+        <select class="select" bind:value={componentId}>
+          <option value={null}>None</option>
+          {#each project?.components ?? [] as c (c.id)}<option value={c.id}>{c.name}</option>{/each}
+        </select>
+      </label>
+      <label>
+        <span class="field-label">Fix version</span>
+        <select class="select" bind:value={fixVersionId}>
+          <option value={null}>None</option>
+          {#each project?.versions ?? [] as v (v.id)}<option value={v.id}>{v.name}</option>{/each}
+        </select>
       </label>
     </div>
 
